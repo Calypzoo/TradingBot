@@ -13,9 +13,9 @@ load_dotenv()
 SYMBOL        = 'BTC/USDT'
 TESTNET       = True         # Set to False for real trading
 
-GRID_LEVELS   = 28
-GRID_SPREAD   = 0.00030      # 0.030%
-ORDER_AMOUNT  = 50           # $ per grid level
+GRID_LEVELS   = 16
+GRID_SPREAD   = 0.00010      # 0.030%
+ORDER_AMOUNT  = 10           # $ per grid level
 
 # ---- CONNECT TO BINANCE ----
 if TESTNET:
