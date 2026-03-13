@@ -11,37 +11,27 @@ load_dotenv()
 
 # ---- SETTINGS ----
 SYMBOL        = 'BTC/USDT'
-TESTNET       = False        # LIVE TRADING
-
 GRID_LEVELS   = 16
 GRID_SPREAD   = 0.00010      # 0.010%
 ORDER_AMOUNT  = 10           # $10 per grid level
 
 # ---- SAFETY SETTINGS ----
-STOP_LOSS_PCT      = 0.15    # Stop everything if BTC drops 15% from start
-MAX_SPEND          = 400     # Never spend more than $400 total (keep $100 reserve)
-EMERGENCY_CONTACT  = True    # Print loud warning when stop loss triggers
+STOP_LOSS_PCT = 0.15         # Stop everything if BTC drops 15% from start
+MAX_SPEND     = 400          # Never spend more than $400 total
 
 # ---- CONNECT TO BINANCE ----
-if TESTNET:
-    else:
-    api_key    = os.getenv('API_KEY')
-    api_secret = os.getenv('API_SECRET')
-    print(f"DEBUG: API_KEY loaded = {'YES' if api_key else 'NO - EMPTY!'}")
-    print(f"DEBUG: API_SECRET loaded = {'YES' if api_secret else 'NO - EMPTY!'}")
-    exchange = ccxt.binance({
-        'apiKey' : api_key,
-        'secret' : api_secret,
-        'options': {'defaultType': 'spot'},
-    })
-    print("RUNNING LIVE - Real money active")
-else:
-    exchange = ccxt.binance({
-        'apiKey' : os.getenv('API_KEY'),
-        'secret' : os.getenv('API_SECRET'),
-        'options': {'defaultType': 'spot'},
-    })
-    print("RUNNING LIVE - Real money active")
+api_key    = os.getenv('API_KEY')
+api_secret = os.getenv('API_SECRET')
+
+print(f"DEBUG: API_KEY loaded = {'YES' if api_key else 'NO - EMPTY!'}")
+print(f"DEBUG: API_SECRET loaded = {'YES' if api_secret else 'NO - EMPTY!'}")
+
+exchange = ccxt.binance({
+    'apiKey' : api_key,
+    'secret' : api_secret,
+    'options': {'defaultType': 'spot'},
+})
+print("RUNNING LIVE - Real money active")
 
 # ---- LOGGING ----
 def log(msg):
@@ -109,7 +99,6 @@ def emergency_sell_all(current_price):
 def run_bot():
     log("=" * 50)
     log("GRID LIVE BOT STARTED")
-    log(f"Mode: {'TESTNET' if TESTNET else 'LIVE'}")
     log(f"Symbol: {SYMBOL} | Levels: {GRID_LEVELS} | Spread: {GRID_SPREAD*100:.3f}%")
     log(f"Order Amount: ${ORDER_AMOUNT} per level")
     log(f"Stop Loss: {STOP_LOSS_PCT*100:.0f}% drop from start price")
@@ -165,7 +154,7 @@ def run_bot():
                 emergency_sell_all(current_price)
                 log("Bot paused. Restart manually when market recovers.")
                 log("Check your Binance account and reassess before restarting.")
-                break  # Stop the bot completely
+                break
 
             # ---- MAX SPEND CHECK ----
             if total_spent >= MAX_SPEND:
