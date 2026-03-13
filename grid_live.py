@@ -24,13 +24,17 @@ EMERGENCY_CONTACT  = True    # Print loud warning when stop loss triggers
 
 # ---- CONNECT TO BINANCE ----
 if TESTNET:
+    else:
+    api_key    = os.getenv('API_KEY')
+    api_secret = os.getenv('API_SECRET')
+    print(f"DEBUG: API_KEY loaded = {'YES' if api_key else 'NO - EMPTY!'}")
+    print(f"DEBUG: API_SECRET loaded = {'YES' if api_secret else 'NO - EMPTY!'}")
     exchange = ccxt.binance({
-        'apiKey' : os.getenv('TESTNET_API_KEY'),
-        'secret' : os.getenv('TESTNET_API_SECRET'),
+        'apiKey' : api_key,
+        'secret' : api_secret,
         'options': {'defaultType': 'spot'},
     })
-    exchange.set_sandbox_mode(True)
-    print("RUNNING ON TESTNET - No real money at risk")
+    print("RUNNING LIVE - Real money active")
 else:
     exchange = ccxt.binance({
         'apiKey' : os.getenv('API_KEY'),
