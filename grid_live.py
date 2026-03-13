@@ -10,7 +10,7 @@ from datetime import datetime
 load_dotenv()
 
 # ---- SETTINGS ----
-SYMBOL        = 'BTC/USDT'
+SYMBOL        = 'BTC/USDC'
 GRID_LEVELS   = 16
 GRID_SPREAD   = 0.00010      # 0.010%
 ORDER_AMOUNT  = 10           # $10 per grid level
@@ -64,14 +64,14 @@ def build_grid(center_price):
 # ---- GET BALANCE ----
 def get_balance():
     balance = exchange.fetch_balance()
-    usdt    = balance['USDT']['free']
+    usdc    = balance['USDC']['free']
     btc     = balance['BTC']['free']
-    return usdt, btc
+    return usdc, btc
 
 # ---- PLACE ORDER ----
-def place_order(side, amount_usdt, price):
+def place_order(side, amount_usdc, price):
     try:
-        btc_amount = round(amount_usdt / price, 5)
+        btc_amount = round(amount_usdc / price, 5)
         if side == 'buy':
             order = exchange.create_market_buy_order(SYMBOL, btc_amount)
         else:
@@ -85,7 +85,7 @@ def place_order(side, amount_usdt, price):
 # ---- SELL ALL BTC (Emergency exit) ----
 def emergency_sell_all(current_price):
     try:
-        usdt_balance, btc_balance = get_balance()
+        usdc_balance, btc_balance = get_balance()
         if btc_balance > 0.0001:
             btc_to_sell = round(btc_balance * 0.999, 5)
             order = exchange.create_market_sell_order(SYMBOL, btc_to_sell)
@@ -140,9 +140,9 @@ def run_bot():
         try:
             ticker        = exchange.fetch_ticker(SYMBOL)
             current_price = ticker['last']
-            usdt_balance, btc_balance = get_balance()
+            usdc_balance, btc_balance = get_balance()
 
-            log(f"Price: ${current_price:,.2f} | Balance: ${usdt_balance:,.2f} USDT | {btc_balance:.6f} BTC | Spent: ${total_spent:,.2f}")
+            log(f"Price: ${current_price:,.2f} | Balance: ${usdc_balance:,.2f} USDC | {btc_balance:.6f} BTC | Spent: ${total_spent:,.2f}")
 
             # ---- STOP LOSS CHECK ----
             if current_price <= stop_loss_price:
@@ -166,7 +166,7 @@ def run_bot():
                 # BUY when price drops to grid level
                 if (current_price <= grid_price < last_price
                         and level['status'] == 'ready'
-                        and usdt_balance >= ORDER_AMOUNT
+                        and usdc_balance >= ORDER_AMOUNT
                         and total_spent < MAX_SPEND):
                     log(f"BUY at grid level ${grid_price:,.2f}")
                     order = place_order('buy', ORDER_AMOUNT, current_price)
