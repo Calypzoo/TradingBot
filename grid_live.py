@@ -11,11 +11,16 @@ load_dotenv()
 
 # ---- SETTINGS ----
 SYMBOL        = 'BTC/USDT'
-TESTNET       = True         # Set to False for real trading
+TESTNET       = False        # LIVE TRADING
 
 GRID_LEVELS   = 16
-GRID_SPREAD   = 0.00010      # 0.030%
-ORDER_AMOUNT  = 10           # $ per grid level
+GRID_SPREAD   = 0.00010      # 0.010%
+ORDER_AMOUNT  = 10           # $10 per grid level
+
+# ---- SAFETY SETTINGS ----
+STOP_LOSS_PCT      = 0.15    # Stop everything if BTC drops 15% from start
+MAX_SPEND          = 400     # Never spend more than $400 total (keep $100 reserve)
+EMERGENCY_CONTACT  = True    # Print loud warning when stop loss triggers
 
 # ---- CONNECT TO BINANCE ----
 if TESTNET:
@@ -32,7 +37,7 @@ else:
         'secret' : os.getenv('API_SECRET'),
         'options': {'defaultType': 'spot'},
     })
-    print("RUNNING LIVE - Real money at risk!")
+    print("RUNNING LIVE - Real money active")
 
 # ---- LOGGING ----
 def log(msg):
@@ -83,6 +88,19 @@ def place_order(side, amount_usdt, price):
         log(f"ORDER FAILED: {e}")
         return None
 
+# ---- SELL ALL BTC (Emergency exit) ----
+def emergency_sell_all(current_price):
+    try:
+        usdt_balance, btc_balance = get_balance()
+        if btc_balance > 0.0001:
+            btc_to_sell = round(btc_balance * 0.999, 5)
+            order = exchange.create_market_sell_order(SYMBOL, btc_to_sell)
+            log(f"EMERGENCY SELL: Sold {btc_to_sell} BTC at ~${current_price:,.0f}")
+            return True
+    except Exception as e:
+        log(f"EMERGENCY SELL FAILED: {e}")
+    return False
+
 # ---- MAIN BOT LOOP ----
 def run_bot():
     log("=" * 50)
@@ -90,6 +108,8 @@ def run_bot():
     log(f"Mode: {'TESTNET' if TESTNET else 'LIVE'}")
     log(f"Symbol: {SYMBOL} | Levels: {GRID_LEVELS} | Spread: {GRID_SPREAD*100:.3f}%")
     log(f"Order Amount: ${ORDER_AMOUNT} per level")
+    log(f"Stop Loss: {STOP_LOSS_PCT*100:.0f}% drop from start price")
+    log(f"Max Spend: ${MAX_SPEND}")
     log("=" * 50)
 
     # Load or build grid state
@@ -99,13 +119,24 @@ def run_bot():
         grid         = state['grid']
         center_price = state['center_price']
         last_price   = state['last_price']
+        total_spent  = state.get('total_spent', 0)
     else:
         ticker       = exchange.fetch_ticker(SYMBOL)
         center_price = ticker['last']
         grid         = build_grid(center_price)
         last_price   = center_price
+        total_spent  = 0
         log(f"New grid built around ${center_price:,.0f}")
-        save_state({'center_price': center_price, 'grid': grid, 'last_price': last_price})
+        save_state({
+            'center_price': center_price,
+            'grid'        : grid,
+            'last_price'  : last_price,
+            'total_spent' : total_spent
+        })
+
+    # Calculate stop loss price
+    stop_loss_price = center_price * (1 - STOP_LOSS_PCT)
+    log(f"Stop loss price set at ${stop_loss_price:,.0f} (15% below ${center_price:,.0f})")
 
     # Print grid levels
     log("Grid levels:")
@@ -118,7 +149,23 @@ def run_bot():
             current_price = ticker['last']
             usdt_balance, btc_balance = get_balance()
 
-            log(f"Price: ${current_price:,.2f} | Balance: ${usdt_balance:,.2f} USDT | {btc_balance:.6f} BTC")
+            log(f"Price: ${current_price:,.2f} | Balance: ${usdt_balance:,.2f} USDT | {btc_balance:.6f} BTC | Spent: ${total_spent:,.2f}")
+
+            # ---- STOP LOSS CHECK ----
+            if current_price <= stop_loss_price:
+                log("!" * 50)
+                log(f"STOP LOSS TRIGGERED!")
+                log(f"BTC dropped to ${current_price:,.0f} which is below stop loss of ${stop_loss_price:,.0f}")
+                log(f"Selling all BTC and pausing bot...")
+                log("!" * 50)
+                emergency_sell_all(current_price)
+                log("Bot paused. Restart manually when market recovers.")
+                log("Check your Binance account and reassess before restarting.")
+                break  # Stop the bot completely
+
+            # ---- MAX SPEND CHECK ----
+            if total_spent >= MAX_SPEND:
+                log(f"Max spend limit of ${MAX_SPEND} reached. Not placing new buys.")
 
             for level in grid:
                 grid_price = level['price']
@@ -126,12 +173,14 @@ def run_bot():
                 # BUY when price drops to grid level
                 if (current_price <= grid_price < last_price
                         and level['status'] == 'ready'
-                        and usdt_balance >= ORDER_AMOUNT):
+                        and usdt_balance >= ORDER_AMOUNT
+                        and total_spent < MAX_SPEND):
                     log(f"BUY at grid level ${grid_price:,.2f}")
                     order = place_order('buy', ORDER_AMOUNT, current_price)
                     if order:
                         level['status']    = 'bought'
                         level['buy_price'] = current_price
+                        total_spent       += ORDER_AMOUNT
 
                 # SELL when price rises back above grid level
                 elif (current_price >= grid_price > last_price
@@ -141,13 +190,19 @@ def run_bot():
                     order = place_order('sell', btc_to_sell * current_price, current_price)
                     if order:
                         level['status'] = 'ready'
+                        total_spent     = max(0, total_spent - ORDER_AMOUNT)
                         pnl = (current_price - level.get('buy_price', grid_price)) / level.get('buy_price', grid_price) * 100
                         log(f"Grid cycle complete! PnL: {pnl:.2f}%")
 
             last_price = current_price
 
             # Save state after every check
-            save_state({'center_price': center_price, 'grid': grid, 'last_price': last_price})
+            save_state({
+                'center_price': center_price,
+                'grid'        : grid,
+                'last_price'  : last_price,
+                'total_spent' : total_spent
+            })
 
         except Exception as e:
             log(f"ERROR: {e}")
