@@ -1,30 +1,50 @@
 import ccxt
-import pandas as pd
-import numpy as np
 import time
 import os
 import json
+import urllib.request
+import urllib.parse
 from dotenv import load_dotenv
 from datetime import datetime
 
 load_dotenv()
 
-# ---- SETTINGS ----
-SYMBOL        = 'BTC/USDC'
-GRID_LEVELS   = 16
-GRID_SPREAD   = 0.00010      # 0.010%
-ORDER_AMOUNT  = 10           # $10 per grid level
+# ================================================================
+# SETTINGS
+# ================================================================
+SYMBOL         = 'BTC/USDC'
+TIMEFRAME      = '1h'
+ORDER_AMOUNT   = 10            # $10 per grid level
+MAX_SPEND      = 400           # never spend more than $400
+STOP_LOSS_PCT  = 0.12          # 12% drop from grid center = emergency exit
+CHECK_INTERVAL = 300           # check every 5 minutes
+RESTART_WAIT   = 600           # wait 10 min after stop loss before restarting
 
-# ---- SAFETY SETTINGS ----
-STOP_LOSS_PCT = 0.15         # Stop everything if BTC drops 15% from start
-MAX_SPEND     = 400          # Never spend more than $400 total
+# Volatility grid settings (auto-adjusted based on ATR ratio)
+GRID_LEVELS_CALM     = 16      # tight calm market
+GRID_LEVELS_NORMAL   = 12      # normal market
+GRID_LEVELS_VOLATILE = 8       # wide volatile market
 
-# ---- CONNECT TO BINANCE ----
+GRID_SPREAD_CALM     = 0.00015 # 0.015%
+GRID_SPREAD_NORMAL   = 0.00020 # 0.020%
+GRID_SPREAD_VOLATILE = 0.00050 # 0.050%
+
+ATR_CALM_THRESHOLD   = 0.7     # ATR ratio below this = calm
+ATR_VOLATILE_THRESHOLD = 1.5   # ATR ratio above this = volatile
+
+# Telegram
+TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+
+# ================================================================
+# CONNECT
+# ================================================================
 api_key    = os.getenv('API_KEY')
 api_secret = os.getenv('API_SECRET')
 
-print(f"DEBUG: API_KEY loaded = {'YES' if api_key else 'NO - EMPTY!'}")
-print(f"DEBUG: API_SECRET loaded = {'YES' if api_secret else 'NO - EMPTY!'}")
+print(f"DEBUG: API_KEY    = {'YES' if api_key else 'NO - EMPTY!'}")
+print(f"DEBUG: API_SECRET = {'YES' if api_secret else 'NO - EMPTY!'}")
+print(f"DEBUG: TELEGRAM   = {'YES' if TELEGRAM_TOKEN else 'NOT SET'}")
 
 exchange = ccxt.binance({
     'apiKey' : api_key,
@@ -33,178 +53,389 @@ exchange = ccxt.binance({
 })
 print("RUNNING LIVE - Real money active")
 
-# ---- LOGGING ----
+# ================================================================
+# LOGGING
+# ================================================================
 def log(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line      = f"[{timestamp}] {msg}"
     print(line)
-    with open('grid_live_log.txt', 'a', encoding='utf-8') as f:
+    with open('bot_log.txt', 'a', encoding='utf-8') as f:
         f.write(line + '\n')
 
-# ---- SAVE/LOAD GRID STATE ----
+# ================================================================
+# TELEGRAM
+# ================================================================
+def telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        text = urllib.parse.quote(f"BTC Bot\n{msg}")
+        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={text}"
+        urllib.request.urlopen(url, timeout=5)
+    except Exception as e:
+        log(f"Telegram failed: {e}")
+
+# ================================================================
+# STATE & STATS
+# ================================================================
 def save_state(state):
-    with open('grid_state.json', 'w') as f:
+    with open('bot_state.json', 'w') as f:
         json.dump(state, f, indent=2)
 
 def load_state():
     try:
-        with open('grid_state.json', 'r') as f:
+        with open('bot_state.json', 'r') as f:
             return json.load(f)
     except:
         return None
 
-# ---- BUILD GRID ----
-def build_grid(center_price):
-    grid = []
-    for i in range(-GRID_LEVELS // 2, GRID_LEVELS // 2 + 1):
-        price = round(center_price * (1 + i * GRID_SPREAD), 2)
-        grid.append({'price': price, 'status': 'ready'})
-    return sorted(grid, key=lambda x: x['price'])
+def clear_state():
+    try:
+        os.remove('bot_state.json')
+    except:
+        pass
 
-# ---- GET BALANCE ----
+def load_stats():
+    try:
+        with open('bot_stats.json', 'r') as f:
+            return json.load(f)
+    except:
+        return {
+            'start_balance' : None,
+            'start_time'    : datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_profit'  : 0.0,
+            'total_cycles'  : 0,
+            'total_buys'    : 0,
+            'total_sells'   : 0,
+            'stop_losses'   : 0,
+            'recenters'     : 0,
+            'last_mode'     : None,
+        }
+
+def save_stats(stats):
+    with open('bot_stats.json', 'w') as f:
+        json.dump(stats, f, indent=2)
+
+# ================================================================
+# MARKET DATA & INDICATORS
+# ================================================================
+def get_candles(limit=60):
+    ohlcv  = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
+    closes = [c[4] for c in ohlcv]
+    highs  = [c[2] for c in ohlcv]
+    lows   = [c[3] for c in ohlcv]
+    return closes, highs, lows
+
+def calc_atr(closes, highs, lows, period=14):
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i-1]),
+            abs(lows[i]  - closes[i-1])
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None, None
+    atr_current = sum(trs[-period:]) / period
+    atr_avg     = sum(trs[-50:]) / min(50, len(trs))
+    return atr_current, atr_current / atr_avg if atr_avg > 0 else 1.0
+
+def get_volatility_mode(atr_ratio):
+    if atr_ratio is None:
+        return 'NORMAL', GRID_LEVELS_NORMAL, GRID_SPREAD_NORMAL
+    if atr_ratio < ATR_CALM_THRESHOLD:
+        return 'CALM', GRID_LEVELS_CALM, GRID_SPREAD_CALM
+    elif atr_ratio > ATR_VOLATILE_THRESHOLD:
+        return 'VOLATILE', GRID_LEVELS_VOLATILE, GRID_SPREAD_VOLATILE
+    else:
+        return 'NORMAL', GRID_LEVELS_NORMAL, GRID_SPREAD_NORMAL
+
 def get_balance():
     balance = exchange.fetch_balance()
-    usdc    = balance['USDC']['free']
-    btc     = balance['BTC']['free']
-    return usdc, btc
+    return balance['USDC']['free'], balance['BTC']['free']
 
-# ---- PLACE ORDER ----
+# ================================================================
+# GRID HELPERS
+# ================================================================
+def build_grid(center, levels, spread):
+    grid = []
+    for i in range(-levels // 2, levels // 2 + 1):
+        price = round(center * (1 + i * spread), 2)
+        grid.append({'price': price, 'status': 'ready', 'buy_price': None})
+    return sorted(grid, key=lambda x: x['price'])
+
+def grid_out_of_range(price, grid):
+    low  = grid[0]['price']
+    high = grid[-1]['price']
+    margin = (high - low) * 0.1
+    return price < (low - margin) or price > (high + margin)
+
+# ================================================================
+# ORDERS
+# ================================================================
 def place_order(side, amount_usdc, price):
     try:
         btc_amount = round(amount_usdc / price, 5)
+        if btc_amount < 0.00001:
+            log(f"ORDER SKIPPED: too small")
+            return None
         if side == 'buy':
             order = exchange.create_market_buy_order(SYMBOL, btc_amount)
         else:
             order = exchange.create_market_sell_order(SYMBOL, btc_amount)
-        log(f"ORDER PLACED: {side.upper()} {btc_amount} BTC at ~${price:,.0f}")
+        log(f"ORDER OK: {side.upper()} {btc_amount} BTC @ ~${price:,.0f}")
         return order
     except Exception as e:
         log(f"ORDER FAILED: {e}")
         return None
 
-# ---- SELL ALL BTC (Emergency exit) ----
-def emergency_sell_all(current_price):
+def sell_all_btc(price, reason=""):
     try:
-        usdc_balance, btc_balance = get_balance()
-        if btc_balance > 0.0001:
-            btc_to_sell = round(btc_balance * 0.999, 5)
-            order = exchange.create_market_sell_order(SYMBOL, btc_to_sell)
-            log(f"EMERGENCY SELL: Sold {btc_to_sell} BTC at ~${current_price:,.0f}")
+        _, btc = get_balance()
+        if btc > 0.00001:
+            order = exchange.create_market_sell_order(SYMBOL, round(btc * 0.999, 5))
+            log(f"SELL ALL: {round(btc*0.999,5)} BTC @ ~${price:,.0f} | {reason}")
             return True
+        log("SELL ALL: Nothing to sell")
+        return True
     except Exception as e:
-        log(f"EMERGENCY SELL FAILED: {e}")
-    return False
+        log(f"SELL ALL FAILED: {e}")
+        return False
 
-# ---- MAIN BOT LOOP ----
-def run_bot():
-    log("=" * 50)
-    log("GRID LIVE BOT STARTED")
-    log(f"Symbol: {SYMBOL} | Levels: {GRID_LEVELS} | Spread: {GRID_SPREAD*100:.3f}%")
-    log(f"Order Amount: ${ORDER_AMOUNT} per level")
-    log(f"Stop Loss: {STOP_LOSS_PCT*100:.0f}% drop from start price")
-    log(f"Max Spend: ${MAX_SPEND}")
-    log("=" * 50)
+# ================================================================
+# HOURLY SUMMARY
+# ================================================================
+def print_summary(stats, usdc, btc, price, vol_mode):
+    total = usdc + btc * price
+    pnl   = total - stats['start_balance'] if stats['start_balance'] else 0
+    pct   = pnl / stats['start_balance'] * 100 if stats['start_balance'] else 0
+    log("=" * 55)
+    log("HOURLY SUMMARY")
+    log(f"  Volatility mode : {vol_mode}")
+    log(f"  BTC price       : ${price:,.2f}")
+    log(f"  USDC balance    : ${usdc:,.2f}")
+    log(f"  BTC held        : {btc:.6f} (~${btc*price:,.2f})")
+    log(f"  Total value     : ${total:,.2f}")
+    log(f"  PnL             : ${pnl:+.2f} ({pct:+.2f}%)")
+    log(f"  Cycles done     : {stats['total_cycles']}")
+    log(f"  Total profit    : ${stats['total_profit']:+.4f}")
+    log(f"  Stop losses     : {stats['stop_losses']}")
+    log(f"  Grid recenters  : {stats['recenters']}")
+    log("=" * 55)
+    telegram(
+        f"Hourly Update\n"
+        f"Mode: {vol_mode}\n"
+        f"BTC: ${price:,.0f}\n"
+        f"Balance: ${total:,.2f}\n"
+        f"PnL: ${pnl:+.2f} ({pct:+.2f}%)\n"
+        f"Cycles: {stats['total_cycles']} | Profit: ${stats['total_profit']:+.2f}"
+    )
+
+# ================================================================
+# MAIN BOT LOOP
+# ================================================================
+def run_session(stats):
+    log("-" * 55)
+    log("STARTING NEW SESSION")
+
+    # Get market data
+    closes, highs, lows = get_candles(limit=60)
+    current_price       = closes[-1]
+    atr, atr_ratio      = calc_atr(closes, highs, lows)
+    vol_mode, levels, spread = get_volatility_mode(atr_ratio)
+
+    log(f"Current price : ${current_price:,.2f}")
+    log(f"ATR ratio     : {atr_ratio:.2f}" if atr_ratio else "ATR: calculating...")
+    log(f"Volatility    : {vol_mode} | Levels: {levels} | Spread: {spread*100:.3f}%")
 
     # Load or build grid state
     state = load_state()
     if state:
-        log(f"Loaded existing grid centered at ${state['center_price']:,.0f}")
         grid         = state['grid']
         center_price = state['center_price']
         last_price   = state['last_price']
         total_spent  = state.get('total_spent', 0)
+        log(f"Loaded grid centered at ${center_price:,.0f}")
     else:
-        ticker       = exchange.fetch_ticker(SYMBOL)
-        center_price = ticker['last']
-        grid         = build_grid(center_price)
-        last_price   = center_price
+        center_price = current_price
+        grid         = build_grid(center_price, levels, spread)
+        last_price   = current_price
         total_spent  = 0
-        log(f"New grid built around ${center_price:,.0f}")
-        save_state({
-            'center_price': center_price,
-            'grid'        : grid,
-            'last_price'  : last_price,
-            'total_spent' : total_spent
-        })
+        log(f"New grid built | Center: ${center_price:,.0f} | Mode: {vol_mode}")
 
-    # Calculate stop loss price
     stop_loss_price = center_price * (1 - STOP_LOSS_PCT)
-    log(f"Stop loss price set at ${stop_loss_price:,.0f} (15% below ${center_price:,.0f})")
+    log(f"Stop loss at  : ${stop_loss_price:,.0f}")
 
-    # Print grid levels
-    log("Grid levels:")
-    for level in grid:
-        log(f"  ${level['price']:,.2f} --- {level['status']}")
+    # Record start balance once
+    if stats['start_balance'] is None:
+        usdc, btc = get_balance()
+        stats['start_balance'] = usdc + btc * current_price
+        save_stats(stats)
+        log(f"Start balance : ${stats['start_balance']:,.2f}")
+        telegram(f"Bot started!\nBalance: ${stats['start_balance']:,.2f}\nBTC: ${current_price:,.0f}\nMode: {vol_mode}")
+
+    save_state({
+        'center_price': center_price,
+        'grid'        : grid,
+        'last_price'  : last_price,
+        'total_spent' : total_spent,
+    })
+
+    last_summary_hour = -1
+    last_vol_mode     = vol_mode
 
     while True:
         try:
-            ticker        = exchange.fetch_ticker(SYMBOL)
-            current_price = ticker['last']
-            usdc_balance, btc_balance = get_balance()
+            closes, highs, lows  = get_candles(limit=60)
+            current_price        = closes[-1]
+            atr, atr_ratio       = calc_atr(closes, highs, lows)
+            vol_mode, levels, spread = get_volatility_mode(atr_ratio)
+            usdc, btc            = get_balance()
 
-            log(f"Price: ${current_price:,.2f} | Balance: ${usdc_balance:,.2f} USDC | {btc_balance:.6f} BTC | Spent: ${total_spent:,.2f}")
+            log(f"${current_price:,.2f} | Mode: {vol_mode} | "
+                f"USDC: ${usdc:,.2f} | BTC: {btc:.6f} | "
+                f"Spent: ${total_spent:,.2f} | ATR ratio: {atr_ratio:.2f}" if atr_ratio
+                else f"${current_price:,.2f} | USDC: ${usdc:,.2f}")
 
-            # ---- STOP LOSS CHECK ----
+            # Hourly summary
+            current_hour = datetime.now().hour
+            if current_hour != last_summary_hour:
+                print_summary(stats, usdc, btc, current_price, vol_mode)
+                last_summary_hour = current_hour
+
+            # Volatility mode change — rebuild grid
+            if vol_mode != last_vol_mode:
+                log(f"VOLATILITY SHIFT: {last_vol_mode} -> {vol_mode}")
+                telegram(f"Volatility shift!\n{last_vol_mode} -> {vol_mode}\nBTC: ${current_price:,.0f}")
+                sell_all_btc(current_price, "vol mode change")
+                time.sleep(3)
+                usdc, btc    = get_balance()
+                center_price = current_price
+                grid         = build_grid(center_price, levels, spread)
+                last_price   = current_price
+                total_spent  = 0
+                stop_loss_price = center_price * (1 - STOP_LOSS_PCT)
+                last_vol_mode = vol_mode
+                log(f"New grid: {levels} levels @ {spread*100:.3f}% | Stop: ${stop_loss_price:,.0f}")
+
+            # Stop loss check
             if current_price <= stop_loss_price:
-                log("!" * 50)
-                log(f"STOP LOSS TRIGGERED!")
-                log(f"BTC dropped to ${current_price:,.0f} which is below stop loss of ${stop_loss_price:,.0f}")
-                log(f"Selling all BTC and pausing bot...")
-                log("!" * 50)
-                emergency_sell_all(current_price)
-                log("Bot paused. Restart manually when market recovers.")
-                log("Check your Binance account and reassess before restarting.")
-                break
+                log("!" * 55)
+                log(f"STOP LOSS! BTC ${current_price:,.0f} <= ${stop_loss_price:,.0f}")
+                log("!" * 55)
+                telegram(
+                    f"STOP LOSS TRIGGERED\n"
+                    f"BTC dropped to ${current_price:,.0f}\n"
+                    f"Stop loss was ${stop_loss_price:,.0f}\n"
+                    f"Selling all BTC and restarting in 10 min"
+                )
+                sell_all_btc(current_price, "stop loss")
+                stats['stop_losses'] += 1
+                save_stats(stats)
+                clear_state()
+                log(f"Waiting {RESTART_WAIT//60} min before restart...")
+                time.sleep(RESTART_WAIT)
+                return 'restart'
 
-            # ---- MAX SPEND CHECK ----
+            # Auto recenter
+            if grid_out_of_range(current_price, grid):
+                log(f"RECENTER: ${current_price:,.0f} outside grid")
+                telegram(f"Grid recentered\nNew center: ${current_price:,.0f}\nMode: {vol_mode}")
+                sell_all_btc(current_price, "recenter")
+                time.sleep(3)
+                usdc, btc    = get_balance()
+                center_price = current_price
+                grid         = build_grid(center_price, levels, spread)
+                last_price   = current_price
+                total_spent  = 0
+                stop_loss_price = center_price * (1 - STOP_LOSS_PCT)
+                stats['recenters'] += 1
+                save_stats(stats)
+                log(f"New grid centered at ${center_price:,.0f}")
+
+            # Max spend check
             if total_spent >= MAX_SPEND:
-                log(f"Max spend limit of ${MAX_SPEND} reached. Not placing new buys.")
+                log(f"Max spend ${MAX_SPEND} reached — buys paused")
 
+            # Grid trading
             for level in grid:
-                grid_price = level['price']
+                gp = level['price']
 
-                # BUY when price drops to grid level
-                if (current_price <= grid_price < last_price
+                # BUY
+                if (current_price <= gp < last_price
                         and level['status'] == 'ready'
-                        and usdc_balance >= ORDER_AMOUNT
+                        and usdc >= ORDER_AMOUNT
                         and total_spent < MAX_SPEND):
-                    log(f"BUY at grid level ${grid_price:,.2f}")
                     order = place_order('buy', ORDER_AMOUNT, current_price)
                     if order:
                         level['status']    = 'bought'
                         level['buy_price'] = current_price
                         total_spent       += ORDER_AMOUNT
+                        stats['total_buys'] += 1
+                        usdc -= ORDER_AMOUNT
 
-                # SELL when price rises back above grid level
-                elif (current_price >= grid_price > last_price
+                # SELL
+                elif (current_price >= gp > last_price
                         and level['status'] == 'bought'):
-                    btc_to_sell = ORDER_AMOUNT / level.get('buy_price', grid_price)
-                    log(f"SELL at grid level ${grid_price:,.2f}")
-                    order = place_order('sell', btc_to_sell * current_price, current_price)
+                    bp          = level['buy_price']
+                    btc_to_sell = ORDER_AMOUNT / bp
+                    order       = place_order('sell', btc_to_sell * current_price, current_price)
                     if order:
-                        level['status'] = 'ready'
-                        total_spent     = max(0, total_spent - ORDER_AMOUNT)
-                        pnl = (current_price - level.get('buy_price', grid_price)) / level.get('buy_price', grid_price) * 100
-                        log(f"Grid cycle complete! PnL: {pnl:.2f}%")
+                        profit = (current_price - bp) / bp * ORDER_AMOUNT
+                        level['status']    = 'ready'
+                        level['buy_price'] = None
+                        total_spent        = max(0, total_spent - ORDER_AMOUNT)
+                        stats['total_sells']  += 1
+                        stats['total_cycles'] += 1
+                        stats['total_profit'] += profit
+                        save_stats(stats)
+                        log(f"CYCLE DONE! Profit: ${profit:+.4f} | Total: ${stats['total_profit']:+.4f}")
+                        telegram(
+                            f"Cycle complete!\n"
+                            f"Profit: ${profit:+.4f}\n"
+                            f"Total profit: ${stats['total_profit']:+.2f}\n"
+                            f"Cycles: {stats['total_cycles']}"
+                        )
 
             last_price = current_price
-
-            # Save state after every check
             save_state({
                 'center_price': center_price,
                 'grid'        : grid,
                 'last_price'  : last_price,
-                'total_spent' : total_spent
+                'total_spent' : total_spent,
             })
 
         except Exception as e:
             log(f"ERROR: {e}")
 
-        # Check every 5 minutes
-        log(f"Sleeping 5 minutes...")
-        log("-" * 50)
-        time.sleep(300)
+        time.sleep(CHECK_INTERVAL)
 
-# ---- RUN ----
+# ================================================================
+# OUTER LOOP — restarts forever
+# ================================================================
+def run_bot():
+    log("=" * 55)
+    log("VOLATILITY ADAPTIVE GRID BOT")
+    log(f"Symbol    : {SYMBOL}")
+    log(f"Order     : ${ORDER_AMOUNT} per level")
+    log(f"Max spend : ${MAX_SPEND}")
+    log(f"Stop loss : {STOP_LOSS_PCT*100:.0f}% from center")
+    log(f"Auto-recenter  : ON")
+    log(f"Auto-restart   : ON")
+    log(f"Telegram alerts: {'ON' if TELEGRAM_TOKEN else 'OFF'}")
+    log("=" * 55)
+
+    stats    = load_stats()
+    restarts = 0
+
+    while True:
+        result = run_session(stats)
+        if result == 'restart':
+            restarts += 1
+            log(f"Restarting (#{restarts})...")
+            stats = load_stats()
+
 if __name__ == '__main__':
     run_bot()
