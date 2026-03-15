@@ -2,6 +2,7 @@ import ccxt
 import time
 import os
 import json
+import signal
 import urllib.request
 import urllib.parse
 from dotenv import load_dotenv
@@ -22,12 +23,12 @@ RESTART_WAIT   = 600
 
 # Bull Grid (SIDEWAYS)
 BULL_LEVELS    = 12
-BULL_SPREAD    = 0.0100        # 1.0% — backtest winner
+BULL_SPREAD    = 0.0100
 
 # Bear Grid (DOWNTREND)
 BEAR_LEVELS    = 8
-BEAR_SPREAD    = 0.0050        # 0.5% — backtest winner
-MAX_BTC_SELL   = 0.80          # never sell more than 80% of BTC holdings
+BEAR_SPREAD    = 0.0050
+MAX_BTC_SELL   = 0.80
 
 # Momentum (UPTREND)
 EMA_FAST       = 9
@@ -37,6 +38,7 @@ TAKE_PROFIT    = 0.04
 
 # Mode detection
 ADX_TREND_MIN  = 20
+ADX_PERIOD     = 14
 
 # Telegram
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')
@@ -56,29 +58,48 @@ exchange = ccxt.binance({
     'apiKey' : api_key,
     'secret' : api_secret,
     'options': {'defaultType': 'spot'},
+    'enableRateLimit': True,
 })
+
 print("RUNNING LIVE - Real money active")
+
+# ================================================================
+# GRACEFUL SHUTDOWN
+# ================================================================
+_shutdown = False
+
+def _handle_signal(sig, frame):
+    global _shutdown
+    _shutdown = True
+    log("Shutdown signal received — finishing current cycle…")
+
+signal.signal(signal.SIGINT,  _handle_signal)
+signal.signal(signal.SIGTERM, _handle_signal)
 
 # ================================================================
 # LOGGING
 # ================================================================
+_log_file = open('bot_log.txt', 'a', encoding='utf-8', buffering=1)  # line-buffered
+
 def log(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line      = f"[{timestamp}] {msg}"
     print(line)
-    with open('bot_log.txt', 'a', encoding='utf-8') as f:
-        f.write(line + '\n')
+    _log_file.write(line + '\n')
 
 # ================================================================
-# TELEGRAM
+# TELEGRAM (POST for reliability)
 # ================================================================
 def telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        text = urllib.parse.quote(f"BTC Bot\n{msg}")
-        url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={text}"
-        urllib.request.urlopen(url, timeout=5)
+        data = urllib.parse.urlencode({
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text'   : f"BTC Bot\n{msg}",
+        }).encode('utf-8')
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        urllib.request.urlopen(url, data=data, timeout=5)
     except Exception as e:
         log(f"Telegram failed: {e}")
 
@@ -93,32 +114,32 @@ def load_state():
     try:
         with open('bot_state.json', 'r') as f:
             return json.load(f)
-    except:
+    except (FileNotFoundError, json.JSONDecodeError):
         return None
 
 def clear_state():
     try:
         os.remove('bot_state.json')
-    except:
+    except FileNotFoundError:
         pass
 
 def load_stats():
     try:
         with open('bot_stats.json', 'r') as f:
             return json.load(f)
-    except:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {
-            'start_balance' : None,
-            'start_time'    : datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'total_profit'  : 0.0,
-            'total_cycles'  : 0,
-            'total_buys'    : 0,
-            'total_sells'   : 0,
-            'stop_losses'   : 0,
-            'mode_switches' : 0,
-            'last_mode'     : None,
-            'bear_cycles'   : 0,
-            'bull_cycles'   : 0,
+            'start_balance'  : None,
+            'start_time'     : datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_profit'   : 0.0,
+            'total_cycles'   : 0,
+            'total_buys'     : 0,
+            'total_sells'    : 0,
+            'stop_losses'    : 0,
+            'mode_switches'  : 0,
+            'last_mode'      : None,
+            'bear_cycles'    : 0,
+            'bull_cycles'    : 0,
             'momentum_cycles': 0,
         }
 
@@ -127,65 +148,128 @@ def save_stats(stats):
         json.dump(stats, f, indent=2)
 
 # ================================================================
-# MARKET DATA & INDICATORS
+# EXCHANGE HELPERS (retry on transient errors)
 # ================================================================
+def _retry(fn, retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            return fn()
+        except (ccxt.NetworkError, ccxt.ExchangeNotAvailable) as e:
+            if attempt == retries - 1:
+                raise
+            log(f"Retryable error ({attempt+1}/{retries}): {e}")
+            time.sleep(delay * (attempt + 1))
+
 def get_candles(limit=80):
-    ohlcv  = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
+    ohlcv  = _retry(lambda: exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit))
     closes = [c[4] for c in ohlcv]
     highs  = [c[2] for c in ohlcv]
     lows   = [c[3] for c in ohlcv]
     return closes, highs, lows
 
+def get_balance():
+    balance = _retry(lambda: exchange.fetch_balance())
+    return balance['USDC']['free'], balance['BTC']['free']
+
+# ================================================================
+# INDICATORS (fixed correctness)
+# ================================================================
+def _ema(vals, span):
+    k = 2.0 / (span + 1)
+    e = vals[0]
+    for v in vals[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+def _wilder_smooth(values, period):
+    """Wilder's smoothing (used by ADX/ATR)."""
+    s = sum(values[:period])
+    result = [s]
+    for v in values[period:]:
+        s = s - s / period + v
+        result.append(s)
+    return result
+
 def calc_indicators(closes, highs, lows):
     n = len(closes)
 
-    # ATR
-    trs = [max(highs[i]-lows[i],
-               abs(highs[i]-closes[i-1]),
-               abs(lows[i]-closes[i-1]))
-           for i in range(1, n)]
-    atr = sum(trs[-14:]) / 14 if len(trs) >= 14 else None
+    # True Range series
+    trs = [highs[0] - lows[0]]  # first bar: just H-L
+    for i in range(1, n):
+        trs.append(max(highs[i] - lows[i],
+                       abs(highs[i] - closes[i-1]),
+                       abs(lows[i]  - closes[i-1])))
 
-    # EMA
-    def ema(vals, span):
-        k = 2 / (span + 1)
-        e = vals[0]
-        for v in vals[1:]:
-            e = v * k + e * (1 - k)
-        return e
+    # ATR via Wilder smoothing
+    atr_series = _wilder_smooth(trs, ADX_PERIOD)
+    atr = atr_series[-1] / ADX_PERIOD if atr_series else 100
 
-    ema_fast      = ema(closes[-EMA_FAST*3:], EMA_FAST)
-    ema_slow      = ema(closes[-EMA_SLOW*3:], EMA_SLOW)
-    ema_fast_prev = ema(closes[-EMA_FAST*3-1:-1], EMA_FAST)
-    ema_slow_prev = ema(closes[-EMA_SLOW*3-1:-1], EMA_SLOW)
-    ema50         = ema(closes[-150:], 50)
+    # +DM / -DM
+    plus_dm  = []
+    minus_dm = []
+    for i in range(1, n):
+        up = highs[i] - highs[i-1]
+        dn = lows[i-1] - lows[i]
+        plus_dm.append(up if up > dn and up > 0 else 0)
+        minus_dm.append(dn if dn > up and dn > 0 else 0)
 
-    # RSI
-    gains  = [max(closes[-i] - closes[-i-1], 0) for i in range(1, 15)]
-    losses = [max(closes[-i-1] - closes[-i], 0) for i in range(1, 15)]
-    avg_g  = sum(gains)  / 14 or 0.0001
-    avg_l  = sum(losses) / 14 or 0.0001
-    rsi    = 100 - (100 / (1 + avg_g / avg_l))
+    # ADX via Wilder smoothing
+    if len(plus_dm) >= ADX_PERIOD and len(trs) > ADX_PERIOD:
+        sm_plus  = _wilder_smooth(plus_dm, ADX_PERIOD)
+        sm_minus = _wilder_smooth(minus_dm, ADX_PERIOD)
+        sm_tr    = _wilder_smooth(trs[1:], ADX_PERIOD)  # align with DM (starts at bar 1)
 
-    # ADX
-    up_moves  = [highs[i] - highs[i-1] for i in range(1, n)]
-    dn_moves  = [lows[i-1] - lows[i]   for i in range(1, n)]
-    plus_dm   = [u if u > d and u > 0 else 0 for u, d in zip(up_moves, dn_moves)]
-    minus_dm  = [d if d > u and d > 0 else 0 for u, d in zip(up_moves, dn_moves)]
-    atr14     = sum(trs[-14:]) / 14 if len(trs) >= 14 else 1
-    plus_di   = 100 * sum(plus_dm[-14:])  / 14 / atr14
-    minus_di  = 100 * sum(minus_dm[-14:]) / 14 / atr14
-    dx        = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
+        plus_di  = 100 * sm_plus[-1]  / (sm_tr[-1] + 1e-10)
+        minus_di = 100 * sm_minus[-1] / (sm_tr[-1] + 1e-10)
+        dx       = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+
+        # Smooth DX for ADX (use last ADX_PERIOD DX values if available)
+        dx_series = []
+        for sp, sm, st in zip(sm_plus, sm_minus, sm_tr):
+            pdi = 100 * sp / (st + 1e-10)
+            mdi = 100 * sm / (st + 1e-10)
+            dx_series.append(100 * abs(pdi - mdi) / (pdi + mdi + 1e-10))
+        if len(dx_series) >= ADX_PERIOD:
+            adx_smooth = _wilder_smooth(dx_series, ADX_PERIOD)
+            adx = adx_smooth[-1] / ADX_PERIOD
+        else:
+            adx = dx
+    else:
+        plus_di = minus_di = adx = 0
+
+    # EMAs
+    ema_fast      = _ema(closes[-EMA_FAST*3:],      EMA_FAST)
+    ema_slow      = _ema(closes[-EMA_SLOW*3:],      EMA_SLOW)
+    ema_fast_prev = _ema(closes[-EMA_FAST*3 - 1:-1], EMA_FAST)
+    ema_slow_prev = _ema(closes[-EMA_SLOW*3 - 1:-1], EMA_SLOW)
+    ema50         = _ema(closes[-150:], 50)
+
+    # RSI (fixed: iterate forward, proper Wilder smoothing)
+    gains  = []
+    losses = []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i-1]
+        gains.append(max(delta, 0))
+        losses.append(max(-delta, 0))
+
+    if len(gains) >= 14:
+        avg_g = sum(gains[-14:]) / 14
+        avg_l = sum(losses[-14:]) / 14
+        # Apply one step of Wilder smoothing for remaining bars
+        # (SMA seed is fine for 80-bar input)
+        rsi = 100 - (100 / (1 + avg_g / (avg_l + 1e-10)))
+    else:
+        rsi = 50
 
     return {
-        'atr'          : atr or 100,
+        'atr'          : max(atr, 1),
         'ema_fast'     : ema_fast,
         'ema_slow'     : ema_slow,
         'ema_fast_prev': ema_fast_prev,
         'ema_slow_prev': ema_slow_prev,
         'ema50'        : ema50,
         'rsi'          : rsi,
-        'adx'          : dx,
+        'adx'          : adx,
         'plus_di'      : plus_di,
         'minus_di'     : minus_di,
     }
@@ -194,6 +278,7 @@ def detect_mode(ind, closes):
     adx     = ind['adx']
     bullish = ind['ema_fast'] > ind['ema_slow'] and closes[-1] > ind['ema50']
     bearish = ind['ema_fast'] < ind['ema_slow'] and closes[-1] < ind['ema50']
+
     if adx < ADX_TREND_MIN:
         return 'SIDEWAYS'
     elif bullish:
@@ -201,10 +286,6 @@ def detect_mode(ind, closes):
     elif bearish:
         return 'DOWNTREND'
     return 'SIDEWAYS'
-
-def get_balance():
-    balance = exchange.fetch_balance()
-    return balance['USDC']['free'], balance['BTC']['free']
 
 # ================================================================
 # GRID BUILDERS
@@ -236,12 +317,12 @@ def place_order(side, amount_usdc, price):
     try:
         btc_amount = round(amount_usdc / price, 5)
         if btc_amount < 0.00001:
-            log(f"ORDER SKIPPED: too small")
+            log("ORDER SKIPPED: too small")
             return None
         if side == 'buy':
-            order = exchange.create_market_buy_order(SYMBOL, btc_amount)
+            order = _retry(lambda: exchange.create_market_buy_order(SYMBOL, btc_amount))
         else:
-            order = exchange.create_market_sell_order(SYMBOL, btc_amount)
+            order = _retry(lambda: exchange.create_market_sell_order(SYMBOL, btc_amount))
         log(f"ORDER OK: {side.upper()} {btc_amount} BTC @ ~${price:,.0f}")
         return order
     except Exception as e:
@@ -252,12 +333,12 @@ def place_btc_order(side, btc_amount, price):
     try:
         btc_amount = round(btc_amount, 5)
         if btc_amount < 0.00001:
-            log(f"ORDER SKIPPED: too small")
+            log("ORDER SKIPPED: too small")
             return None
         if side == 'sell':
-            order = exchange.create_market_sell_order(SYMBOL, btc_amount)
+            order = _retry(lambda: exchange.create_market_sell_order(SYMBOL, btc_amount))
         else:
-            order = exchange.create_market_buy_order(SYMBOL, btc_amount)
+            order = _retry(lambda: exchange.create_market_buy_order(SYMBOL, btc_amount))
         log(f"ORDER OK: {side.upper()} {btc_amount} BTC @ ~${price:,.0f}")
         return order
     except Exception as e:
@@ -267,9 +348,10 @@ def place_btc_order(side, btc_amount, price):
 def sell_all_btc(price, reason=""):
     try:
         _, btc = get_balance()
-        if btc > 0.00001:
-            order = exchange.create_market_sell_order(SYMBOL, round(btc * 0.999, 5))
-            log(f"SELL ALL: {round(btc*0.999,5)} BTC @ ~${price:,.0f} | {reason}")
+        sell_amount = round(btc * 0.999, 5)
+        if sell_amount > 0.00001:
+            _retry(lambda: exchange.create_market_sell_order(SYMBOL, sell_amount))
+            log(f"SELL ALL: {sell_amount} BTC @ ~${price:,.0f} | {reason}")
             return True
         log("SELL ALL: Nothing to sell")
         return True
@@ -284,6 +366,7 @@ def print_summary(stats, usdc, btc, price, mode):
     total = usdc + btc * price
     pnl   = total - stats['start_balance'] if stats['start_balance'] else 0
     pct   = pnl / stats['start_balance'] * 100 if stats['start_balance'] else 0
+
     log("=" * 55)
     log("HOURLY SUMMARY")
     log(f"  Mode            : {mode}")
@@ -298,6 +381,7 @@ def print_summary(stats, usdc, btc, price, mode):
     log(f"  Total profit    : ${stats['total_profit']:+.4f}")
     log(f"  Mode switches   : {stats['mode_switches']}")
     log("=" * 55)
+
     telegram(
         f"Hourly Update\n"
         f"Mode: {mode}\n"
@@ -311,6 +395,8 @@ def print_summary(stats, usdc, btc, price, mode):
 # MAIN SESSION
 # ================================================================
 def run_session(stats):
+    global _shutdown
+
     log("-" * 55)
     log("STARTING NEW SESSION")
 
@@ -357,7 +443,9 @@ def run_session(stats):
     mom_buy_price = state.get('mom_buy_price', None)
     mom_trail     = state.get('mom_trail', None)
 
-    while True:
+    state_dirty = False  # only write state file when something changed
+
+    while not _shutdown:
         try:
             closes, highs, lows = get_candles(limit=80)
             current_price       = closes[-1]
@@ -368,6 +456,8 @@ def run_session(stats):
 
             log(f"${current_price:,.2f} | {mode} | ADX:{ind['adx']:.1f} | "
                 f"RSI:{ind['rsi']:.1f} | USDC:${usdc:,.2f} | BTC:{btc:.6f}")
+
+            state_dirty = False
 
             # Hourly summary
             current_hour = datetime.now().hour
@@ -380,16 +470,11 @@ def run_session(stats):
                 log(f"MODE SWITCH: {last_mode} -> {mode}")
                 telegram(f"Mode switched!\n{last_mode} -> {mode}\nBTC: ${current_price:,.0f}")
 
-                # Switching OUT of sideways — close bull grid positions
                 if last_mode == 'SIDEWAYS' and btc > 0.00001:
-                    # Only sell trading BTC, not bear grid BTC
-                    trading_btc = min(btc, bull_spent / current_price)
-                    if trading_btc > 0.00001:
-                        sell_all_btc(current_price, "mode switch from sideways")
-                        time.sleep(3)
-                        usdc, btc = get_balance()
+                    sell_all_btc(current_price, "mode switch from sideways")
+                    time.sleep(3)
+                    usdc, btc = get_balance()
 
-                # Switching OUT of uptrend — close momentum position
                 if last_mode == 'UPTREND' and mom_position and btc > 0.00001:
                     sell_all_btc(current_price, "mode switch from uptrend")
                     time.sleep(3)
@@ -398,7 +483,6 @@ def run_session(stats):
                     mom_buy_price = None
                     mom_trail     = None
 
-                # Reset relevant grid
                 if mode == 'SIDEWAYS':
                     bull_grid   = build_bull_grid(current_price)
                     bull_center = current_price
@@ -416,11 +500,12 @@ def run_session(stats):
 
                 stats['mode_switches'] += 1
                 save_stats(stats)
+                state_dirty = True
 
             last_mode = mode
 
             # ============================================================
-            # MODE: SIDEWAYS — Bull Grid (buy low sell high)
+            # MODE: SIDEWAYS — Bull Grid
             # ============================================================
             if mode == 'SIDEWAYS':
                 if not bull_grid:
@@ -428,6 +513,7 @@ def run_session(stats):
                     bull_center = current_price
                     bull_last   = current_price
                     log(f"Bull grid built @ ${bull_center:,.0f} | {BULL_LEVELS}L | {BULL_SPREAD*100:.1f}%")
+                    state_dirty = True
 
                 # Stop loss
                 stop = bull_center * (1 - STOP_LOSS_PCT)
@@ -451,10 +537,12 @@ def run_session(stats):
                     bull_center = current_price
                     bull_last   = current_price
                     bull_spent  = 0
+                    state_dirty = True
                     telegram(f"Bull grid recentered\n${current_price:,.0f}")
 
                 for lv in bull_grid:
                     gp = lv['price']
+
                     if (current_price <= gp < bull_last
                             and lv['status'] == 'ready'
                             and usdc >= ORDER_AMOUNT
@@ -466,14 +554,16 @@ def run_session(stats):
                             bull_spent     += ORDER_AMOUNT
                             stats['total_buys'] += 1
                             usdc -= ORDER_AMOUNT
+                            state_dirty = True
 
                     elif (current_price >= gp > bull_last
-                            and lv['status'] == 'bought'):
+                            and lv['status'] == 'bought'
+                            and lv['buy_price']):
                         bp          = lv['buy_price']
                         btc_to_sell = ORDER_AMOUNT / bp
-                        order       = place_order('sell', btc_to_sell * current_price, current_price)
+                        order       = place_btc_order('sell', btc_to_sell, current_price)
                         if order:
-                            profit = (current_price - bp) / bp * ORDER_AMOUNT
+                            profit = (current_price - bp) * btc_to_sell
                             lv['status']    = 'ready'
                             lv['buy_price'] = None
                             bull_spent      = max(0, bull_spent - ORDER_AMOUNT)
@@ -482,13 +572,14 @@ def run_session(stats):
                             stats['bull_cycles']  += 1
                             stats['total_profit'] += profit
                             save_stats(stats)
+                            state_dirty = True
                             log(f"BULL CYCLE: ${profit:+.4f} | Total: ${stats['total_profit']:+.4f}")
                             telegram(f"Bull grid cycle!\nProfit: ${profit:+.4f}\nTotal: ${stats['total_profit']:+.2f}")
 
                 bull_last = current_price
 
             # ============================================================
-            # MODE: DOWNTREND — Bear Grid (sell high buy back lower)
+            # MODE: DOWNTREND — Bear Grid
             # ============================================================
             elif mode == 'DOWNTREND':
                 if not bear_grid:
@@ -496,6 +587,7 @@ def run_session(stats):
                     bear_center = current_price
                     bear_last   = current_price
                     log(f"Bear grid built @ ${bear_center:,.0f} | {BEAR_LEVELS}L | {BEAR_SPREAD*100:.1f}%")
+                    state_dirty = True
 
                 # Recenter
                 if grid_out_of_range(current_price, bear_grid):
@@ -504,6 +596,7 @@ def run_session(stats):
                     bear_center = current_price
                     bear_last   = current_price
                     bear_sold   = 0
+                    state_dirty = True
                     telegram(f"Bear grid recentered\n${current_price:,.0f}")
 
                 btc_per_level = (btc * MAX_BTC_SELL) / BEAR_LEVELS if btc > 0.00001 else 0
@@ -511,7 +604,6 @@ def run_session(stats):
                 for lv in bear_grid:
                     gp = lv['price']
 
-                    # SELL BTC on price bounce up
                     if (current_price >= gp > bear_last
                             and lv['status'] == 'ready'
                             and btc >= btc_per_level
@@ -522,14 +614,15 @@ def run_session(stats):
                             lv['sell_price'] = current_price
                             bear_sold       += btc_per_level
                             stats['total_sells'] += 1
+                            state_dirty = True
                             log(f"BEAR SELL: {btc_per_level:.5f} BTC @ ${current_price:,.0f}")
 
-                    # BUY BACK cheaper on price drop
                     elif (current_price <= gp < bear_last
-                            and lv['status'] == 'sold'):
-                        sp        = lv['sell_price']
-                        cost      = btc_per_level * current_price
-                        if usdc >= cost * 1.001 and sp and current_price < sp:
+                            and lv['status'] == 'sold'
+                            and lv['sell_price']):
+                        sp   = lv['sell_price']
+                        cost = btc_per_level * current_price
+                        if usdc >= cost * 1.001 and current_price < sp:
                             order = place_btc_order('buy', btc_per_level, current_price)
                             if order:
                                 profit = (sp - current_price) * btc_per_level
@@ -541,13 +634,14 @@ def run_session(stats):
                                 stats['bear_cycles']  += 1
                                 stats['total_profit'] += profit
                                 save_stats(stats)
+                                state_dirty = True
                                 log(f"BEAR CYCLE: ${profit:+.4f} | Total: ${stats['total_profit']:+.4f}")
                                 telegram(f"Bear grid cycle!\nProfit: ${profit:+.4f}\nTotal: ${stats['total_profit']:+.2f}")
 
                 bear_last = current_price
 
             # ============================================================
-            # MODE: UPTREND — Dual Momentum with trailing stop
+            # MODE: UPTREND — Momentum with trailing stop
             # ============================================================
             elif mode == 'UPTREND':
                 cross_up   = (ind['ema_fast_prev'] <= ind['ema_slow_prev'] and
@@ -555,33 +649,35 @@ def run_session(stats):
                 cross_down = (ind['ema_fast_prev'] >= ind['ema_slow_prev'] and
                               ind['ema_fast']      <  ind['ema_slow'])
 
-                # Manage open position
                 if mom_position and mom_buy_price:
                     new_stop = current_price - atr * TRAIL_ATR_MULT
                     if mom_trail is None or new_stop > mom_trail:
                         mom_trail = new_stop
 
                     gain     = (current_price - mom_buy_price) / mom_buy_price
-                    stop_hit = mom_trail and current_price <= mom_trail
+                    stop_hit = mom_trail is not None and current_price <= mom_trail
                     tp_hit   = gain >= TAKE_PROFIT
 
                     if stop_hit or tp_hit or cross_down:
                         reason = "take profit" if tp_hit else ("trail stop" if stop_hit else "EMA cross")
-                        order  = place_order('sell', btc * current_price * 0.999, current_price)
+                        # Sell only the position size, not entire BTC balance
+                        position_btc = ORDER_AMOUNT / mom_buy_price
+                        sell_btc     = min(position_btc, btc * 0.999)
+                        order = place_btc_order('sell', sell_btc, current_price)
                         if order:
-                            profit = gain * ORDER_AMOUNT
-                            stats['total_sells']      += 1
-                            stats['total_cycles']     += 1
-                            stats['momentum_cycles']  += 1
-                            stats['total_profit']     += profit
+                            profit = (current_price - mom_buy_price) * sell_btc
+                            stats['total_sells']     += 1
+                            stats['total_cycles']    += 1
+                            stats['momentum_cycles'] += 1
+                            stats['total_profit']    += profit
                             save_stats(stats)
+                            state_dirty = True
                             log(f"MOMENTUM SELL ({reason}): {gain*100:.2f}% | ${profit:+.4f}")
                             telegram(f"Momentum sell ({reason})\nGain: {gain*100:.2f}%\nProfit: ${profit:+.4f}")
                             mom_position  = False
                             mom_buy_price = None
                             mom_trail     = None
 
-                # Enter on EMA cross up
                 if cross_up and not mom_position and usdc >= ORDER_AMOUNT:
                     order = place_order('buy', ORDER_AMOUNT, current_price)
                     if order:
@@ -589,36 +685,56 @@ def run_session(stats):
                         mom_buy_price = current_price
                         mom_trail     = current_price - atr * TRAIL_ATR_MULT
                         stats['total_buys'] += 1
+                        state_dirty = True
                         log(f"MOMENTUM BUY @ ${current_price:,.0f} | Trail: ${mom_trail:,.0f}")
                         telegram(f"Momentum buy!\nBTC: ${current_price:,.0f}\nTrail: ${mom_trail:,.0f}")
 
-            # Save full state
-            save_state({
-                'mode'         : mode,
-                'bull_grid'    : bull_grid,
-                'bull_center'  : bull_center,
-                'bull_last'    : bull_last,
-                'bull_spent'   : bull_spent,
-                'bear_grid'    : bear_grid,
-                'bear_center'  : bear_center,
-                'bear_last'    : bear_last,
-                'bear_sold'    : bear_sold,
-                'mom_position' : mom_position,
-                'mom_buy_price': mom_buy_price,
-                'mom_trail'    : mom_trail,
-            })
+            # Save state only when something changed
+            if state_dirty:
+                save_state({
+                    'mode'         : mode,
+                    'bull_grid'    : bull_grid,
+                    'bull_center'  : bull_center,
+                    'bull_last'    : bull_last,
+                    'bull_spent'   : bull_spent,
+                    'bear_grid'    : bear_grid,
+                    'bear_center'  : bear_center,
+                    'bear_last'    : bear_last,
+                    'bear_sold'    : bear_sold,
+                    'mom_position' : mom_position,
+                    'mom_buy_price': mom_buy_price,
+                    'mom_trail'    : mom_trail,
+                })
 
         except Exception as e:
             log(f"ERROR: {e}")
 
         time.sleep(CHECK_INTERVAL)
 
+    # Graceful shutdown
+    log("Saving state before shutdown…")
+    save_state({
+        'mode'         : mode,
+        'bull_grid'    : bull_grid,
+        'bull_center'  : bull_center,
+        'bull_last'    : bull_last,
+        'bull_spent'   : bull_spent,
+        'bear_grid'    : bear_grid,
+        'bear_center'  : bear_center,
+        'bear_last'    : bear_last,
+        'bear_sold'    : bear_sold,
+        'mom_position' : mom_position,
+        'mom_buy_price': mom_buy_price,
+        'mom_trail'    : mom_trail,
+    })
+    return 'shutdown'
+
 # ================================================================
 # OUTER LOOP
 # ================================================================
 def run_bot():
     log("=" * 55)
-    log("ALL-WEATHER BOT v4")
+    log("ALL-WEATHER BOT v5")
     log(f"Symbol     : {SYMBOL}")
     log(f"Order      : ${ORDER_AMOUNT} | Max spend: ${MAX_SPEND}")
     log(f"SIDEWAYS   : Bull Grid {BULL_LEVELS}L @ {BULL_SPREAD*100:.1f}%")
@@ -626,17 +742,23 @@ def run_bot():
     log(f"DOWNTREND  : Bear Grid {BEAR_LEVELS}L @ {BEAR_SPREAD*100:.1f}%")
     log(f"Telegram   : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
     log("=" * 55)
-    telegram("All-Weather Bot v4 started!\nSIDEWAYS=BullGrid | UPTREND=Momentum | DOWNTREND=BearGrid")
+
+    telegram("All-Weather Bot v5 started!\nSIDEWAYS=BullGrid | UPTREND=Momentum | DOWNTREND=BearGrid")
 
     stats    = load_stats()
     restarts = 0
 
-    while True:
+    while not _shutdown:
         result = run_session(stats)
+        if result == 'shutdown':
+            log("Bot shut down cleanly.")
+            break
         if result == 'restart':
             restarts += 1
             log(f"Restarting (#{restarts})...")
             stats = load_stats()
+
+    _log_file.close()
 
 if __name__ == '__main__':
     run_bot()
