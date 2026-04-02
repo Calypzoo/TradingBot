@@ -3,6 +3,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python grid_live.py"
+    "startCommand": "python bot_v7.py"
   }
 }
