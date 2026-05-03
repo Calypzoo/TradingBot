@@ -21,8 +21,8 @@ load_dotenv()
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
-ORDER_AMOUNT    = 20
-MAX_SPEND       = 450
+ORDER_AMOUNT    = 40
+MAX_SPEND       = 900
 STOP_LOSS_PCT   = 0.12
 CHECK_INTERVAL  = 120
 RESTART_WAIT    = 600
