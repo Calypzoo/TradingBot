@@ -12,25 +12,32 @@ from datetime import datetime
 load_dotenv()
 
 # ================================================================
-# ALL-WEATHER BOT v7.2
+# ALL-WEATHER BOT v7.3
 # SIDEWAYS  = Bull Grid 12L @ 1.0%  (buy low sell high)
 # UPTREND   = Dual Momentum EMA9/21 (ride the trend)
 # DOWNTREND = Bear Grid 8L @ 0.75%  (sell high buy back lower)
 # ADX hysteresis: enter>25, exit<15
-# RSI filter: skip bull grid buys when RSI>58
+# RSI filter: skip bull grid buys when RSI>58, skip momentum buys when RSI>=70
 #
-# v7.2 patches:
-#   - Mode switch loop fixed: last_mode is set BEFORE any exchange
-#     calls, and each cleanup block is isolated with try/except.
-#     A failed sell during a switch can no longer cause the bot to
-#     re-trigger the same switch every cycle.
+# v7.3 patches (5. Mai 2026):
+#   - Cold-Start gap fixed: simplified UPTREND entry logic no longer
+#     depends on a "just entered" event flag, so entries work after
+#     Railway redeploy when state file is wiped (last_mode = None).
+#   - RSI filter for momentum entries (RSI_MOM_MAX = 70). Prevents
+#     buying near top zones (RSI 80+ events like Oct 2025 ATH).
+#   - Inventory check: skip momentum entry if untracked BTC > ORDER_AMOUNT,
+#     to avoid double-buying on cold-start when previous session BTC
+#     is still in the wallet.
+#   - Bullish consistency: UPTREND entry now requires price > e50 in
+#     addition to ef > es (matches the mode() decision criteria).
+#   - Removed just_entered_uptrend flag (made redundant by simpler logic).
+#
+# v7.2 patches (5. Mai 2026):
+#   - Mode switch loop fixed: last_mode set BEFORE exchange calls,
+#     each cleanup block isolated with try/except.
 #   - Bear buyback fixed: was guarded by sell_btc(-nsold,...) which
-#     always returned None (negative qty), so the buy never ran.
-#   - UPTREND entry buy: when the bot enters UPTREND mid-trend (no
-#     fresh EMA cross), it now still buys once if ef>es. Previously
-#     it sat in UPTREND without a position until the next cross.
-#   - State persistence: save_state runs every cycle, not only when
-#     dirty=True. last_mode now survives Railway restarts cleanly.
+#     always returned None (negative qty), so buy never ran.
+#   - State persistence: save_state runs every cycle.
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
@@ -49,6 +56,7 @@ EMA_SLOW        = 21
 TRAIL_ATR_MULT  = 2.0
 TAKE_PROFIT     = 0.04
 RSI_BUY_MAX     = 58
+RSI_MOM_MAX     = 70
 ADX_ENTER       = 25
 ADX_EXIT        = 15
 ADX_PERIOD      = 14
@@ -346,11 +354,11 @@ def run_session(stats):
         save_stats(stats)
         log(f"Start balance: ${stats['start_balance']:,.2f}")
         telegram(
-            f"ALL-WEATHER BOT v7 STARTED\n"
+            f"ALL-WEATHER BOT v7.3 STARTED\n"
             f"Balance: ${stats['start_balance']:,.2f}\n"
             f"BTC: ${price:,.0f} | Mode: {m}\n"
             f"Order: ${ORDER_AMOUNT} | Check: {CHECK_INTERVAL}s\n"
-            f"Bull: 1% | Bear: 0.75% | RSI<{RSI_BUY_MAX}"
+            f"Bull: 1% | Bear: 0.75% | RSI<{RSI_BUY_MAX} | Mom-RSI<{RSI_MOM_MAX}"
         )
 
     last_hour  = -1
@@ -382,7 +390,6 @@ def run_session(stats):
                 f"RSI:{rsi:.1f} | USDC:${usdc:,.2f} | BTC:{btc:.6f}")
 
             dirty = False
-            just_entered_uptrend = False
 
             # Hourly summary
             h = datetime.now().hour
@@ -438,14 +445,14 @@ def run_session(stats):
                 ngrid = []; nsold  = 0
                 mom_on = False; mom_bp = None; mom_ts = None
 
+                # Initialize new mode (v7.3: UPTREND needs no special init,
+                # entry logic handles it via inventory_idle + bullish + RSI)
                 if m == 'SIDEWAYS':
                     bgrid = bull_grid(price); bcenter = price
                     blast = price; bspent = 0
                 elif m == 'DOWNTREND':
                     ngrid = bear_grid(price); ncenter = price
                     nlast = price; nsold = 0
-                elif m == 'UPTREND':
-                    just_entered_uptrend = True
 
                 stats['mode_switches'] += 1
                 save_stats(stats); dirty = True
@@ -554,11 +561,12 @@ def run_session(stats):
                                 telegram(f"Bear cycle ${profit:+.4f}\nTotal ${stats['total_profit']:+.2f}")
                 nlast = price
 
-            # ---- UPTREND: Momentum ----
+            # ---- UPTREND: Momentum (v7.3 simplified entry) ----
             elif m == 'UPTREND':
                 cup = ind['efp'] <= ind['esp'] and ind['ef'] > ind['es']
                 cdn = ind['efp'] >= ind['esp'] and ind['ef'] < ind['es']
-                bullish = ind['ef'] > ind['es']  # v7.2: for mid-trend entry
+                # v7.3: bullish consistent with mode() — both EMA cross AND price > e50
+                bullish = ind['ef'] > ind['es'] and price > ind['e50']
 
                 if mom_on and mom_bp:
                     new_ts = price - atr*TRAIL_ATR_MULT
@@ -580,16 +588,21 @@ def run_session(stats):
                             telegram(f"Momentum sell ({reason})\n{gain*100:.2f}% ${profit:+.4f}")
                             mom_on = False; mom_bp = None; mom_ts = None
 
-                # v7.2: enter on fresh cross OR on first cycle in UPTREND if still bullish
-                can_enter = cup or (just_entered_uptrend and bullish)
-                if can_enter and not mom_on and usdc >= ORDER_AMOUNT:
+                # v7.3 entry: simplified, gated by RSI + inventory check.
+                # Works on cold-start, mode-switch, and continuous UPTREND alike.
+                inventory_idle = btc * price < ORDER_AMOUNT
+                if (not mom_on
+                        and inventory_idle
+                        and bullish
+                        and rsi < RSI_MOM_MAX
+                        and usdc >= ORDER_AMOUNT):
                     if buy_usdc(ORDER_AMOUNT, price):
                         mom_on = True; mom_bp = price
                         mom_ts = price - atr*TRAIL_ATR_MULT
                         dirty  = True
-                        entry_reason = "cross" if cup else "mid-trend entry"
-                        log(f"MOM BUY ({entry_reason}) @ ${price:,.0f} trail ${mom_ts:,.0f}")
-                        telegram(f"Momentum buy ({entry_reason}) ${price:,.0f}\nTrail ${mom_ts:,.0f}")
+                        entry_reason = "cross" if cup else "ongoing"
+                        log(f"MOM BUY ({entry_reason}) @ ${price:,.0f} | RSI:{rsi:.1f} | trail ${mom_ts:,.0f}")
+                        telegram(f"Momentum buy ({entry_reason}) ${price:,.0f}\nRSI {rsi:.1f} | Trail ${mom_ts:,.0f}")
 
             # v7.2: ALWAYS save state — last_mode survives Railway restarts
             save_state({
@@ -622,17 +635,17 @@ def run_session(stats):
 # ================================================================
 def main():
     log("=" * 52)
-    log("ALL-WEATHER BOT v7.2")
+    log("ALL-WEATHER BOT v7.3")
     log(f"Symbol  : {SYMBOL}")
     log(f"Order   : ${ORDER_AMOUNT} | Max: ${MAX_SPEND}")
     log(f"Check   : {CHECK_INTERVAL}s")
     log(f"Bull    : {BULL_LEVELS}L @ {BULL_SPREAD*100:.1f}% | RSI<{RSI_BUY_MAX}")
     log(f"Bear    : {BEAR_LEVELS}L @ {BEAR_SPREAD*100:.2f}%")
-    log(f"Mom     : EMA{EMA_FAST}/{EMA_SLOW} trail {TRAIL_ATR_MULT}x ATR")
+    log(f"Mom     : EMA{EMA_FAST}/{EMA_SLOW} trail {TRAIL_ATR_MULT}x ATR | RSI<{RSI_MOM_MAX}")
     log(f"ADX     : enter>{ADX_ENTER} exit<{ADX_EXIT}")
     log(f"Telegram: {'ON' if TELEGRAM_TOKEN else 'OFF'}")
     log("=" * 52)
-    telegram("ALL-WEATHER BOT v7.2 ONLINE")
+    telegram("ALL-WEATHER BOT v7.3 ONLINE")
 
     stats    = load_stats()
     restarts = 0
