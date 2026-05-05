@@ -12,12 +12,25 @@ from datetime import datetime
 load_dotenv()
 
 # ================================================================
-# ALL-WEATHER BOT v7
+# ALL-WEATHER BOT v7.2
 # SIDEWAYS  = Bull Grid 12L @ 1.0%  (buy low sell high)
 # UPTREND   = Dual Momentum EMA9/21 (ride the trend)
 # DOWNTREND = Bear Grid 8L @ 0.75%  (sell high buy back lower)
 # ADX hysteresis: enter>25, exit<15
 # RSI filter: skip bull grid buys when RSI>58
+#
+# v7.2 patches:
+#   - Mode switch loop fixed: last_mode is set BEFORE any exchange
+#     calls, and each cleanup block is isolated with try/except.
+#     A failed sell during a switch can no longer cause the bot to
+#     re-trigger the same switch every cycle.
+#   - Bear buyback fixed: was guarded by sell_btc(-nsold,...) which
+#     always returned None (negative qty), so the buy never ran.
+#   - UPTREND entry buy: when the bot enters UPTREND mid-trend (no
+#     fresh EMA cross), it now still buys once if ef>es. Previously
+#     it sat in UPTREND without a position until the next cross.
+#   - State persistence: save_state runs every cycle, not only when
+#     dirty=True. last_mode now survives Railway restarts cleanly.
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
@@ -369,6 +382,7 @@ def run_session(stats):
                 f"RSI:{rsi:.1f} | USDC:${usdc:,.2f} | BTC:{btc:.6f}")
 
             dirty = False
+            just_entered_uptrend = False
 
             # Hourly summary
             h = datetime.now().hour
@@ -376,32 +390,50 @@ def run_session(stats):
                 summary(stats, usdc, btc, price, m)
                 last_hour = h
 
-            # Mode switch
+            # ---- Mode switch (v7.2: last_mode set BEFORE any exchange calls,
+            #      cleanup blocks isolated so a failed sell can't trap us in
+            #      a re-trigger loop) ----
             if m != last_mode and last_mode is not None:
-                log(f"MODE: {last_mode} → {m}")
-                telegram(f"Mode: {last_mode} → {m}\nBTC: ${price:,.0f}")
+                prev_mode = last_mode
+                last_mode = m  # commit FIRST — survives any exception below
 
-                if last_mode == 'SIDEWAYS' and btc > 0.00001:
-                    sell_all(price, "leaving SIDEWAYS")
-                    time.sleep(3); usdc, btc = get_balance()
+                log(f"MODE: {prev_mode} → {m}")
+                telegram(f"Mode: {prev_mode} → {m}\nBTC: ${price:,.0f}")
 
-                if last_mode == 'UPTREND' and mom_on and btc > 0.00001:
-                    sell_all(price, "leaving UPTREND")
-                    time.sleep(3); usdc, btc = get_balance()
-                    mom_on = False; mom_bp = None; mom_ts = None
+                # Cleanup leaving SIDEWAYS
+                try:
+                    if prev_mode == 'SIDEWAYS' and btc > 0.00001:
+                        sell_all(price, "leaving SIDEWAYS")
+                        time.sleep(3); usdc, btc = get_balance()
+                except Exception as e:
+                    log(f"SWITCH cleanup SIDEWAYS error: {e}")
 
-                if last_mode == 'DOWNTREND' and nsold > 0.00001:
-                    cost = nsold * price
-                    if usdc >= cost * 1.001:
-                        if sell_btc(-nsold, price) is not None:
-                            o = _retry(lambda: exchange.create_market_buy_order(
+                # Cleanup leaving UPTREND
+                try:
+                    if prev_mode == 'UPTREND' and mom_on and btc > 0.00001:
+                        sell_all(price, "leaving UPTREND")
+                        time.sleep(3); usdc, btc = get_balance()
+                        mom_on = False; mom_bp = None; mom_ts = None
+                except Exception as e:
+                    log(f"SWITCH cleanup UPTREND error: {e}")
+
+                # Cleanup leaving DOWNTREND (v7.2: direct buy, no negative-qty hack)
+                try:
+                    if prev_mode == 'DOWNTREND' and nsold > 0.00001:
+                        cost = nsold * price
+                        if usdc >= cost * 1.001:
+                            _retry(lambda: exchange.create_market_buy_order(
                                 SYMBOL, round(nsold, 5)))
-                            log(f"BEAR BUYBACK: {nsold:.5f} BTC")
+                            log(f"BEAR BUYBACK: {nsold:.5f} BTC @ ${price:,.0f}")
                             telegram(f"Bear buyback {nsold:.5f} BTC @ ${price:,.0f}")
-                            nsold = 0; time.sleep(3); usdc, btc = get_balance()
-                    else:
-                        log(f"WARNING: Can't afford buyback ${cost:,.0f}")
+                            nsold = 0
+                            time.sleep(3); usdc, btc = get_balance()
+                        else:
+                            log(f"WARNING: Can't afford buyback ${cost:,.0f}")
+                except Exception as e:
+                    log(f"SWITCH cleanup DOWNTREND error: {e}")
 
+                # Always reset position state, regardless of exchange errors
                 bgrid = []; bspent = 0
                 ngrid = []; nsold  = 0
                 mom_on = False; mom_bp = None; mom_ts = None
@@ -413,7 +445,7 @@ def run_session(stats):
                     ngrid = bear_grid(price); ncenter = price
                     nlast = price; nsold = 0
                 elif m == 'UPTREND':
-                    pass
+                    just_entered_uptrend = True
 
                 stats['mode_switches'] += 1
                 save_stats(stats); dirty = True
@@ -526,6 +558,7 @@ def run_session(stats):
             elif m == 'UPTREND':
                 cup = ind['efp'] <= ind['esp'] and ind['ef'] > ind['es']
                 cdn = ind['efp'] >= ind['esp'] and ind['ef'] < ind['es']
+                bullish = ind['ef'] > ind['es']  # v7.2: for mid-trend entry
 
                 if mom_on and mom_bp:
                     new_ts = price - atr*TRAIL_ATR_MULT
@@ -547,23 +580,26 @@ def run_session(stats):
                             telegram(f"Momentum sell ({reason})\n{gain*100:.2f}% ${profit:+.4f}")
                             mom_on = False; mom_bp = None; mom_ts = None
 
-                if cup and not mom_on and usdc >= ORDER_AMOUNT:
+                # v7.2: enter on fresh cross OR on first cycle in UPTREND if still bullish
+                can_enter = cup or (just_entered_uptrend and bullish)
+                if can_enter and not mom_on and usdc >= ORDER_AMOUNT:
                     if buy_usdc(ORDER_AMOUNT, price):
                         mom_on = True; mom_bp = price
                         mom_ts = price - atr*TRAIL_ATR_MULT
                         dirty  = True
-                        log(f"MOM BUY @ ${price:,.0f} trail ${mom_ts:,.0f}")
-                        telegram(f"Momentum buy ${price:,.0f}\nTrail ${mom_ts:,.0f}")
+                        entry_reason = "cross" if cup else "mid-trend entry"
+                        log(f"MOM BUY ({entry_reason}) @ ${price:,.0f} trail ${mom_ts:,.0f}")
+                        telegram(f"Momentum buy ({entry_reason}) ${price:,.0f}\nTrail ${mom_ts:,.0f}")
 
-            if dirty:
-                save_state({
-                    'mode': m,
-                    'bgrid': bgrid, 'bcenter': bcenter,
-                    'blast': blast, 'bspent': bspent,
-                    'ngrid': ngrid, 'ncenter': ncenter,
-                    'nlast': nlast, 'nsold': nsold,
-                    'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
-                })
+            # v7.2: ALWAYS save state — last_mode survives Railway restarts
+            save_state({
+                'mode': m,
+                'bgrid': bgrid, 'bcenter': bcenter,
+                'blast': blast, 'bspent': bspent,
+                'ngrid': ngrid, 'ncenter': ncenter,
+                'nlast': nlast, 'nsold': nsold,
+                'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
+            })
 
         except Exception as e:
             log(f"ERROR: {e}")
@@ -586,7 +622,7 @@ def run_session(stats):
 # ================================================================
 def main():
     log("=" * 52)
-    log("ALL-WEATHER BOT v7")
+    log("ALL-WEATHER BOT v7.2")
     log(f"Symbol  : {SYMBOL}")
     log(f"Order   : ${ORDER_AMOUNT} | Max: ${MAX_SPEND}")
     log(f"Check   : {CHECK_INTERVAL}s")
@@ -596,7 +632,7 @@ def main():
     log(f"ADX     : enter>{ADX_ENTER} exit<{ADX_EXIT}")
     log(f"Telegram: {'ON' if TELEGRAM_TOKEN else 'OFF'}")
     log("=" * 52)
-    telegram("ALL-WEATHER BOT v7 ONLINE")
+    telegram("ALL-WEATHER BOT v7.2 ONLINE")
 
     stats    = load_stats()
     restarts = 0
