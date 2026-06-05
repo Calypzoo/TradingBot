@@ -52,7 +52,7 @@ ADX_PERIOD      = 14
 #   die bot-eigene e50 (1h) als Regime-Gate genutzt - Prinzip validiert,
 #   exakter Span auf 1h NICHT. Vor Live: Testnet/Dry-Run (siehe README-Notiz).
 # ================================================================
-BOT_VERSION         = 'v7.6'
+BOT_VERSION         = 'v7.6.1'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
@@ -71,7 +71,10 @@ print(f"TELEGRAM   = {'YES' if TELEGRAM_TOKEN else 'NOT SET'}")
 exchange = ccxt.binance({
     'apiKey' : api_key,
     'secret' : api_secret,
-    'options': {'defaultType': 'spot'},
+    # v7.6.1: fetchCurrencies=False -> load_markets ruft NICHT den
+    # geo-gesperrten SAPI-Endpoint capital/config/getall auf (451 in DE/EU).
+    # Bot braucht keine Currency-Metadaten; Kurse/Balance/Orders laufen ueber api/v3.
+    'options': {'defaultType': 'spot', 'fetchCurrencies': False},
     'enableRateLimit': True,
 })
 
