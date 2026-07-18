@@ -52,7 +52,7 @@ ADX_PERIOD      = 14
 #   die bot-eigene e50 (1h) als Regime-Gate genutzt - Prinzip validiert,
 #   exakter Span auf 1h NICHT. Vor Live: Testnet/Dry-Run (siehe README-Notiz).
 # ================================================================
-BOT_VERSION         = 'v7.6.1'
+BOT_VERSION         = 'v7.6.4'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
@@ -379,6 +379,7 @@ def run_session(stats):
     mom_bp     = state.get('mom_bp', None)
     mom_ts     = state.get('mom_ts', None)
     dirty      = False
+    bear_paused = False  # v7.6.4: einmaliges Logging der Bear-Grid-Pause
 
     # v7.6 Whipsaw-Cooldown: max WHIPSAW_MAX_TRADES Entry-Buys pro rollender Stunde
     recent_buys = []
@@ -550,6 +551,17 @@ def run_session(stats):
 
                 bpl = (btc * MAX_BTC_SELL) / BEAR_LEVELS if btc > 0.00001 else 0
 
+                # v7.6.4: Anti-Fragmentierung im Bear Grid - keine Orders unter
+                # MIN_TICKET_USD. Ist der BTC-Bestand dafuer zu klein, pausiert
+                # der Bear-Zyklus (gewolltes Verhalten, kein Fehler).
+                if bpl * price < MIN_TICKET_USD:
+                    if bpl > 0 and not bear_paused:
+                        log(f"BEAR PAUSED: per-level ${bpl*price:.2f} < min ticket ${MIN_TICKET_USD:.0f}")
+                        bear_paused = True
+                    bpl = 0
+                else:
+                    bear_paused = False
+
                 for lv in ngrid:
                     gp = lv['p']
                     # SELL BTC on bounce up
@@ -567,7 +579,9 @@ def run_session(stats):
                             and lv['sp']):
                         sp   = lv['sp']
                         cost = bpl * price
-                        if usdc >= cost*1.001 and price < sp:
+                        # v7.6.4: Buyback nur wenn Gewinn > Fee-Huerde
+                        # (vorher: price < sp -> Cent-Gewinne, Fees fressen alles)
+                        if usdc >= cost*1.001 and price <= sp * (1 - MIN_PROFIT_PCT):
                             if buy_usdc(cost, price, is_entry=False):
                                 profit = (sp - price) * bpl
                                 lv['st'] = 'ready'; lv['sp'] = None
