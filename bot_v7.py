@@ -22,6 +22,7 @@ load_dotenv()
 #       min-profit, whipsaw cooldown, bear-buyback bugfix
 # v7.6.5: trade watchdog (stale-trade alarm + last-trade age in summary)
 # v7.6.6: watchdog threshold 48h -> 72h (kalibriert an Livedaten 07-08/2026)
+# v7.6.7: BEAR_LEVELS 8 -> 4 (Bear Grid war dauerhaft unter MIN_TICKET_USD)
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
@@ -32,7 +33,13 @@ CHECK_INTERVAL  = 120
 RESTART_WAIT    = 600
 BULL_LEVELS     = 12
 BULL_SPREAD     = 0.0100
-BEAR_LEVELS     = 8
+BEAR_LEVELS     = 4     # v7.6.7: 8 -> 4. Order pro Level = btc*MAX_BTC_SELL/LEVELS.
+                        # Bei 0.00239 BTC (~$153): 8 Levels = $15.31, 5 = $24.50,
+                        # 4 = $30.63. Nur 4 liegt ueber MIN_TICKET_USD ($25), alles
+                        # darueber laesst das Bear Grid dauerhaft pausieren.
+                        # ACHTUNG: faellt der BTC-Gegenwert unter ~$125, blockiert
+                        # auch 4. Der Watchdog (v7.6.5) meldet das dann.
+                        # Optimale Level-Zahl: siehe backtest_regime.py Sweep.
 BEAR_SPREAD     = 0.0075
 MAX_BTC_SELL    = 0.80
 EMA_FAST        = 9
@@ -54,7 +61,7 @@ ADX_PERIOD      = 14
 #   die bot-eigene e50 (1h) als Regime-Gate genutzt - Prinzip validiert,
 #   exakter Span auf 1h NICHT. Vor Live: Testnet/Dry-Run (siehe README-Notiz).
 # ================================================================
-BOT_VERSION         = 'v7.6.6'
+BOT_VERSION         = 'v7.6.7'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
