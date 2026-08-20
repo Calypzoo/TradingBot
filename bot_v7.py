@@ -8,9 +8,9 @@ import urllib.request
 import urllib.parse
 from dotenv import load_dotenv
 from datetime import datetime
-
+ 
 load_dotenv()
-
+ 
 # ================================================================
 # ALL-WEATHER BOT v7.6
 # SIDEWAYS  = Bull Grid 12L @ 1.0%  (buy low sell high)
@@ -20,6 +20,8 @@ load_dotenv()
 # RSI filter: skip bull grid buys when RSI>58
 # v7.6: non-liquidating mode switch, e50 regime gate, min-ticket,
 #       min-profit, whipsaw cooldown, bear-buyback bugfix
+# v7.6.5: trade watchdog (stale-trade alarm + last-trade age in summary)
+# v7.6.6: watchdog threshold 48h -> 72h (kalibriert an Livedaten 07-08/2026)
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
@@ -41,7 +43,7 @@ RSI_BUY_MAX     = 58
 ADX_ENTER       = 25
 ADX_EXIT        = 15
 ADX_PERIOD      = 14
-
+ 
 # ================================================================
 # v7.6 PATCHES
 #   Backtest-validiert (5m, Jan-Mai 2026): Improved schlaegt Baseline 5/5
@@ -52,22 +54,36 @@ ADX_PERIOD      = 14
 #   die bot-eigene e50 (1h) als Regime-Gate genutzt - Prinzip validiert,
 #   exakter Span auf 1h NICHT. Vor Live: Testnet/Dry-Run (siehe README-Notiz).
 # ================================================================
-BOT_VERSION         = 'v7.6.4'
+BOT_VERSION         = 'v7.6.6'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
 REGIME_FILTER       = True      # kein Bull-Grid-Kauf wenn Preis < e50 (Falling-Knife-Schutz)
 WHIPSAW_MAX_TRADES  = 6         # max. Entry-Buys pro rollender Stunde, dann Cooldown
-
+ 
+# ================================================================
+# v7.6.5 WATCHDOG
+#   Hintergrund: Im April lief der Bot 24 Tage ohne einen einzigen Trade,
+#   ohne dass es auffiel. Der Watchdog macht Trade-Stille sichtbar:
+#   Telegram-Alarm, sobald STALE_TRADE_HOURS ohne ausgefuehrte Order
+#   vergangen sind (max. 1 Erinnerung pro STALE_REMIND_HOURS). Zusaetzlich
+#   zeigt die stuendliche Summary jetzt das Alter des letzten Trades.
+#   Reines Monitoring - kann keinen Trade ausloesen oder verhindern.
+# ================================================================
+STALE_TRADE_HOURS   = 72        # Alarm, wenn so lange keine Order ausgefuehrt wurde
+                                # v7.6.6: 48h -> 72h. Livedaten 18.07.-19.08.: 7 Luecken
+                                # >48h im Normalbetrieb, nur 1 >72h (max 4 Tage).
+STALE_REMIND_HOURS  = 24        # Alarm-Erinnerung hoechstens einmal pro X Stunden
+ 
 TELEGRAM_TOKEN   = os.getenv('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 api_key          = os.getenv('API_KEY')
 api_secret       = os.getenv('API_SECRET')
-
+ 
 print(f"API_KEY    = {'YES' if api_key else 'MISSING'}")
 print(f"API_SECRET = {'YES' if api_secret else 'MISSING'}")
 print(f"TELEGRAM   = {'YES' if TELEGRAM_TOKEN else 'NOT SET'}")
-
+ 
 exchange = ccxt.binance({
     'apiKey' : api_key,
     'secret' : api_secret,
@@ -77,30 +93,30 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'spot', 'fetchCurrencies': False},
     'enableRateLimit': True,
 })
-
+ 
 # ================================================================
 # SHUTDOWN
 # ================================================================
 _shutdown = False
-
+ 
 def _handle_signal(sig, frame):
     global _shutdown
     _shutdown = True
     log("Shutdown signal — finishing cycle…")
-
+ 
 signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
-
+ 
 # ================================================================
 # LOGGING
 # ================================================================
 _log_file = open('v7_log.txt', 'a', encoding='utf-8', buffering=1)
-
+ 
 def log(msg):
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     print(line)
     _log_file.write(line + '\n')
-
+ 
 # ================================================================
 # TELEGRAM
 # ================================================================
@@ -118,7 +134,7 @@ def telegram(msg):
         )
     except Exception as e:
         log(f"Telegram error: {e}")
-
+ 
 # ================================================================
 # STATE
 # ================================================================
@@ -132,17 +148,17 @@ def _write(path, data):
         try: os.unlink(tmp)
         except: pass
         raise
-
+ 
 def save_state(s): _write('v7_state.json', json.dumps(s, indent=2))
 def load_state():
     try:
         with open('v7_state.json') as f: return json.load(f)
     except: return None
-
+ 
 def clear_state():
     try: os.remove('v7_state.json')
     except: pass
-
+ 
 def load_stats():
     try:
         with open('v7_stats.json') as f: return json.load(f)
@@ -158,9 +174,9 @@ def load_stats():
             'mode_switches': 0,
             'stop_losses'  : 0,
         }
-
+ 
 def save_stats(s): _write('v7_stats.json', json.dumps(s, indent=2))
-
+ 
 # ================================================================
 # EXCHANGE
 # ================================================================
@@ -171,17 +187,17 @@ def _retry(fn, retries=3):
             if i == retries - 1: raise
             log(f"Retry {i+1}/{retries}: {e}")
             time.sleep(3 * (i + 1))
-
+ 
 def get_candles():
     ohlcv = _retry(lambda: exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=80))
     return ([c[4] for c in ohlcv],
             [c[2] for c in ohlcv],
             [c[3] for c in ohlcv])
-
+ 
 def get_balance():
     b = _retry(lambda: exchange.fetch_balance())
     return b['USDC']['free'], b['BTC']['free']
-
+ 
 # ================================================================
 # INDICATORS
 # ================================================================
@@ -189,12 +205,12 @@ def _ema(vals, span):
     k = 2.0 / (span + 1); e = vals[0]
     for v in vals[1:]: e = v*k + e*(1-k)
     return e
-
+ 
 def _wilder(vals, p):
     s = sum(vals[:p]); r = [s]
     for v in vals[p:]: s = s - s/p + v; r.append(s)
     return r
-
+ 
 def indicators(closes, highs, lows):
     n = len(closes)
     trs = [highs[0]-lows[0]]
@@ -203,13 +219,13 @@ def indicators(closes, highs, lows):
                        abs(highs[i]-closes[i-1]),
                        abs(lows[i]-closes[i-1])))
     atr = _wilder(trs, ADX_PERIOD)[-1] / ADX_PERIOD
-
+ 
     pdm, mdm = [], []
     for i in range(1, n):
         u = highs[i]-highs[i-1]; d = lows[i-1]-lows[i]
         pdm.append(u if u > d and u > 0 else 0)
         mdm.append(d if d > u and d > 0 else 0)
-
+ 
     adx = 0
     if len(pdm) >= ADX_PERIOD:
         sp = _wilder(pdm, ADX_PERIOD)
@@ -223,13 +239,13 @@ def indicators(closes, highs, lows):
             dxs.append(100*abs(p-m)/(p+m+1e-10))
         if len(dxs) >= ADX_PERIOD:
             adx = _wilder(dxs, ADX_PERIOD)[-1] / ADX_PERIOD
-
+ 
     ef  = _ema(closes[-EMA_FAST*3:],      EMA_FAST)
     es  = _ema(closes[-EMA_SLOW*3:],      EMA_SLOW)
     efp = _ema(closes[-EMA_FAST*3-1:-1],  EMA_FAST)
     esp = _ema(closes[-EMA_SLOW*3-1:-1],  EMA_SLOW)
     e50 = _ema(closes[-150:], 50)
-
+ 
     gs, ls = [], []
     for i in range(1, len(closes)):
         d = closes[i]-closes[i-1]
@@ -237,10 +253,10 @@ def indicators(closes, highs, lows):
     ag = sum(gs[-14:])/14 or 1e-10
     al = sum(ls[-14:])/14 or 1e-10
     rsi = 100 - 100/(1 + ag/al)
-
+ 
     return {'atr': max(atr,1), 'ef': ef, 'es': es, 'efp': efp,
             'esp': esp, 'e50': e50, 'rsi': rsi, 'adx': adx}
-
+ 
 def mode(ind, closes, last=None):
     adx  = ind['adx']
     bull = ind['ef'] > ind['es'] and closes[-1] > ind['e50']
@@ -255,7 +271,7 @@ def mode(ind, closes, last=None):
         if bull:             return 'UPTREND'
         if bear:             return 'DOWNTREND'
         return last
-
+ 
 # ================================================================
 # GRIDS
 # ================================================================
@@ -265,19 +281,19 @@ def bull_grid(center):
         g.append({'p': round(center*(1+i*BULL_SPREAD),2),
                   'st': 'ready', 'bp': None})
     return sorted(g, key=lambda x: x['p'])
-
+ 
 def bear_grid(center):
     g = []
     for i in range(-BEAR_LEVELS//2, BEAR_LEVELS//2+1):
         g.append({'p': round(center*(1+i*BEAR_SPREAD),2),
                   'st': 'ready', 'sp': None})
     return sorted(g, key=lambda x: x['p'])
-
+ 
 def out_of_range(price, grid):
     lo = grid[0]['p']; hi = grid[-1]['p']
     m  = (hi-lo)*0.10
     return price < lo-m or price > hi+m
-
+ 
 # ================================================================
 # ORDERS
 # ================================================================
@@ -293,7 +309,7 @@ def buy_usdc(amount_usdc, price, is_entry=True):
         return o
     except Exception as e:
         log(f"BUY FAILED: {e}"); return None
-
+ 
 def sell_btc(qty, price):
     try:
         qty = round(qty, 5)
@@ -303,21 +319,24 @@ def sell_btc(qty, price):
         return o
     except Exception as e:
         log(f"SELL FAILED: {e}"); return None
-
+ 
 def sell_all(price, reason):
     _, btc = get_balance()
     qty = round(btc*0.999, 5)
     if qty > 0.00001:
         _retry(lambda: exchange.create_market_sell_order(SYMBOL, qty))
         log(f"SELL ALL {qty} BTC @ ~${price:,.0f} | {reason}")
-
+ 
 # ================================================================
 # SUMMARY
 # ================================================================
-def summary(stats, usdc, btc, price, m):
+def summary(stats, usdc, btc, price, m, last_trade_ts=None):
     total = usdc + btc*price
     pnl   = total - stats['start_balance'] if stats['start_balance'] else 0
     pct   = pnl/stats['start_balance']*100 if stats['start_balance'] else 0
+    # v7.6.5: Alter des letzten Trades (None = noch keiner bekannt)
+    lt = (f"{(time.time()-last_trade_ts)/3600:.1f}h ago"
+          if last_trade_ts else "none yet")
     log("=" * 52)
     log(f"  Mode     : {m}")
     log(f"  BTC      : ${price:,.2f}")
@@ -327,14 +346,16 @@ def summary(stats, usdc, btc, price, m):
     log(f"  PnL      : ${pnl:+.2f} ({pct:+.2f}%)")
     log(f"  Profit   : ${stats['total_profit']:+.4f} | Cycles: {stats['total_cycles']}")
     log(f"  Bull/Bear/Mom: {stats['bull_cycles']}/{stats['bear_cycles']}/{stats['mom_cycles']}")
+    log(f"  LastTrade: {lt}")
     log("=" * 52)
     telegram(
         f"Mode: {m} | BTC: ${price:,.0f}\n"
         f"Balance: ${total:,.2f} | PnL: ${pnl:+.2f} ({pct:+.2f}%)\n"
         f"Profit: ${stats['total_profit']:+.2f} | "
-        f"B/Br/M: {stats['bull_cycles']}/{stats['bear_cycles']}/{stats['mom_cycles']}"
+        f"B/Br/M: {stats['bull_cycles']}/{stats['bear_cycles']}/{stats['mom_cycles']}\n"
+        f"Last trade: {lt}"
     )
-
+ 
 # ================================================================
 # MAIN
 # ================================================================
@@ -342,16 +363,16 @@ def run_session(stats):
     global _shutdown
     log("-" * 52)
     log("NEW SESSION")
-
+ 
     closes, highs, lows = get_candles()
     price = closes[-1]
     ind   = indicators(closes, highs, lows)
     m     = mode(ind, closes)
-
+ 
     log(f"${price:,.2f} | {m} | ADX:{ind['adx']:.1f} | RSI:{ind['rsi']:.1f}")
-
+ 
     state = load_state() or {}
-
+ 
     if not stats['start_balance']:
         usdc, btc = get_balance()
         stats['start_balance'] = usdc + btc*price
@@ -364,7 +385,7 @@ def run_session(stats):
             f"Order: ${ORDER_AMOUNT} | Check: {CHECK_INTERVAL}s\n"
             f"Bull: 1% | Bear: 0.75% | RSI<{RSI_BUY_MAX}"
         )
-
+ 
     last_hour  = -1
     last_mode  = state.get('mode', None)
     bgrid      = state.get('bgrid', [])
@@ -380,7 +401,15 @@ def run_session(stats):
     mom_ts     = state.get('mom_ts', None)
     dirty      = False
     bear_paused = False  # v7.6.4: einmaliges Logging der Bear-Grid-Pause
-
+ 
+    # v7.6.5 Watchdog: letzter ausgefuehrter Trade (epoch) + Alarm-Drossel.
+    # last_trade_ts wird im State persistiert; vor dem ersten Trade dient der
+    # Session-Start als Referenz (Restart verschiebt den Alarm schlimmstenfalls
+    # um eine Session, loest aber keinen Fehlalarm aus).
+    session_start    = time.time()
+    last_trade_ts    = state.get('last_trade_ts')
+    last_stale_alert = 0.0
+ 
     # v7.6 Whipsaw-Cooldown: max WHIPSAW_MAX_TRADES Entry-Buys pro rollender Stunde
     recent_buys = []
     def _whipsaw_ok():
@@ -391,7 +420,7 @@ def run_session(stats):
             return False
         recent_buys.append(now)
         return True
-
+ 
     while not _shutdown:
         try:
             closes, highs, lows = get_candles()
@@ -401,23 +430,36 @@ def run_session(stats):
             usdc, btc = get_balance()
             atr   = ind['atr']
             rsi   = ind['rsi']
-
+ 
             log(f"${price:,.2f} | {m} | ADX:{ind['adx']:.1f} | "
                 f"RSI:{rsi:.1f} | USDC:${usdc:,.2f} | BTC:{btc:.6f}")
-
+ 
             dirty = False
-
+ 
             # Hourly summary
             h = datetime.now().hour
             if h != last_hour:
-                summary(stats, usdc, btc, price, m)
+                summary(stats, usdc, btc, price, m, last_trade_ts)
                 last_hour = h
-
+ 
+            # v7.6.5 Watchdog: Alarm bei zu langer Trade-Stille
+            _wd_ref = last_trade_ts or session_start
+            stale_h = (time.time() - _wd_ref) / 3600
+            if (stale_h >= STALE_TRADE_HOURS
+                    and time.time() - last_stale_alert >= STALE_REMIND_HOURS*3600):
+                why = ""
+                if bear_paused and m == 'DOWNTREND':
+                    why = "\nBear grid PAUSED (BTC below min ticket)"
+                log(f"WATCHDOG: no executed trade for {stale_h:.0f}h | mode {m}")
+                telegram(f"WATCHDOG: no trade for {stale_h:.0f}h\n"
+                         f"Mode: {m} | BTC: ${price:,.0f}{why}")
+                last_stale_alert = time.time()
+ 
             # Mode switch
             if m != last_mode and last_mode is not None:
                 log(f"MODE: {last_mode} → {m}")
                 telegram(f"Mode: {last_mode} → {m}\nBTC: ${price:,.0f}")
-
+ 
                 if NON_LIQUIDATING:
                     # v7.6: KEINE Mass-Liquidation beim Moduswechsel.
                     # Bestehendes BTC bleibt im Wallet (kein erzwungener Verlust);
@@ -428,12 +470,12 @@ def run_session(stats):
                     if last_mode == 'SIDEWAYS' and btc > 0.00001:
                         sell_all(price, "leaving SIDEWAYS")
                         time.sleep(3); usdc, btc = get_balance()
-
+ 
                     if last_mode == 'UPTREND' and mom_on and btc > 0.00001:
                         sell_all(price, "leaving UPTREND")
                         time.sleep(3); usdc, btc = get_balance()
                         mom_on = False; mom_bp = None; mom_ts = None
-
+ 
                     if last_mode == 'DOWNTREND' and nsold > 0.00001:
                         cost = nsold * price
                         if usdc >= cost * 1.001:
@@ -444,17 +486,18 @@ def run_session(stats):
                             if o is not None:
                                 log(f"BEAR BUYBACK: {nsold:.5f} BTC")
                                 telegram(f"Bear buyback {nsold:.5f} BTC @ ${price:,.0f}")
+                                last_trade_ts = time.time()  # v7.6.5
                                 nsold = 0; time.sleep(3); usdc, btc = get_balance()
                         else:
                             log(f"WARNING: Can't afford buyback ${cost:,.0f}")
-
+ 
                 # Momentum-Status zuruecksetzen (keine offene Trail-Verwaltung ausserhalb UPTREND)
                 if last_mode == 'UPTREND':
                     mom_on = False; mom_bp = None; mom_ts = None
-
+ 
                 bgrid = []; bspent = 0
                 ngrid = []; nsold  = 0
-
+ 
                 if m == 'SIDEWAYS':
                     bgrid = bull_grid(price); bcenter = price
                     blast = price; bspent = 0
@@ -463,12 +506,12 @@ def run_session(stats):
                     nlast = price; nsold = 0
                 elif m == 'UPTREND':
                     pass
-
+ 
                 stats['mode_switches'] += 1
                 save_stats(stats); dirty = True
-
+ 
             last_mode = m
-
+ 
             # ---- SIDEWAYS: Bull Grid + RSI filter ----
             if m == 'SIDEWAYS':
                 if not bgrid:
@@ -476,7 +519,7 @@ def run_session(stats):
                     blast = price; bspent = 0
                     log(f"Bull grid @ ${bcenter:,.0f} | {BULL_LEVELS}L | {BULL_SPREAD*100:.1f}%")
                     dirty = True
-
+ 
                 # Stop loss
                 if price <= bcenter * (1 - STOP_LOSS_PCT):
                     log(f"STOP LOSS @ ${price:,.0f}")
@@ -485,7 +528,7 @@ def run_session(stats):
                     stats['stop_losses'] += 1; save_stats(stats)
                     clear_state(); time.sleep(RESTART_WAIT)
                     return 'restart'
-
+ 
                 # Recenter
                 if out_of_range(price, bgrid):
                     if NON_LIQUIDATING:
@@ -502,7 +545,7 @@ def run_session(stats):
                         bgrid = bull_grid(price); bcenter = price
                         blast = price; bspent = 0; dirty = True
                         telegram(f"Bull recentered ${price:,.0f}")
-
+ 
                 for lv in bgrid:
                     gp = lv['p']
                     # BUY — RSI filter + v7.6 Regime-Gate + Whipsaw-Cooldown
@@ -515,6 +558,7 @@ def run_session(stats):
                         if _whipsaw_ok() and buy_usdc(ORDER_AMOUNT, price):
                             lv['st'] = 'bought'; lv['bp'] = price
                             bspent += ORDER_AMOUNT; usdc -= ORDER_AMOUNT
+                            last_trade_ts = time.time()  # v7.6.5
                             dirty = True
                     # SELL — v7.6: nur mit Mindestprofit (> Fee-Huerde)
                     elif (price >= gp > blast
@@ -526,6 +570,7 @@ def run_session(stats):
                         if sell_btc(qty, price):
                             profit = (price - bp) * qty
                             lv['st'] = 'ready'; lv['bp'] = None
+                            last_trade_ts = time.time()  # v7.6.5
                             bspent = max(0, bspent - ORDER_AMOUNT)
                             stats['total_profit'] += profit
                             stats['total_cycles'] += 1
@@ -534,7 +579,7 @@ def run_session(stats):
                             log(f"BULL CYCLE ${profit:+.4f} | Total ${stats['total_profit']:+.4f}")
                             telegram(f"Bull cycle ${profit:+.4f}\nTotal ${stats['total_profit']:+.2f}")
                 blast = price
-
+ 
             # ---- DOWNTREND: Bear Grid ----
             elif m == 'DOWNTREND':
                 if not ngrid:
@@ -542,15 +587,15 @@ def run_session(stats):
                     nlast = price; nsold = 0
                     log(f"Bear grid @ ${ncenter:,.0f} | {BEAR_LEVELS}L | {BEAR_SPREAD*100:.2f}%")
                     dirty = True
-
+ 
                 if out_of_range(price, ngrid):
                     log(f"BEAR RECENTER @ ${price:,.0f}")
                     ngrid = bear_grid(price); ncenter = price
                     nlast = price; nsold = 0; dirty = True
                     telegram(f"Bear recentered ${price:,.0f}")
-
+ 
                 bpl = (btc * MAX_BTC_SELL) / BEAR_LEVELS if btc > 0.00001 else 0
-
+ 
                 # v7.6.4: Anti-Fragmentierung im Bear Grid - keine Orders unter
                 # MIN_TICKET_USD. Ist der BTC-Bestand dafuer zu klein, pausiert
                 # der Bear-Zyklus (gewolltes Verhalten, kein Fehler).
@@ -561,7 +606,7 @@ def run_session(stats):
                     bpl = 0
                 else:
                     bear_paused = False
-
+ 
                 for lv in ngrid:
                     gp = lv['p']
                     # SELL BTC on bounce up
@@ -572,6 +617,7 @@ def run_session(stats):
                         if sell_btc(bpl, price):
                             lv['st'] = 'sold'; lv['sp'] = price
                             nsold += bpl; dirty = True
+                            last_trade_ts = time.time()  # v7.6.5
                             log(f"BEAR SELL {bpl:.5f} BTC @ ${price:,.0f}")
                     # BUY BACK cheaper
                     elif (price <= gp < nlast
@@ -585,6 +631,7 @@ def run_session(stats):
                             if buy_usdc(cost, price, is_entry=False):
                                 profit = (sp - price) * bpl
                                 lv['st'] = 'ready'; lv['sp'] = None
+                                last_trade_ts = time.time()  # v7.6.5
                                 nsold = max(0, nsold - bpl)
                                 stats['total_profit'] += profit
                                 stats['total_cycles'] += 1
@@ -593,24 +640,25 @@ def run_session(stats):
                                 log(f"BEAR CYCLE ${profit:+.4f} | Total ${stats['total_profit']:+.4f}")
                                 telegram(f"Bear cycle ${profit:+.4f}\nTotal ${stats['total_profit']:+.2f}")
                 nlast = price
-
+ 
             # ---- UPTREND: Momentum ----
             elif m == 'UPTREND':
                 cup = ind['efp'] <= ind['esp'] and ind['ef'] > ind['es']
                 cdn = ind['efp'] >= ind['esp'] and ind['ef'] < ind['es']
-
+ 
                 if mom_on and mom_bp:
                     new_ts = price - atr*TRAIL_ATR_MULT
                     if mom_ts is None or new_ts > mom_ts: mom_ts = new_ts
                     gain     = (price - mom_bp) / mom_bp
                     stop_hit = mom_ts and price <= mom_ts
                     tp_hit   = gain >= TAKE_PROFIT
-
+ 
                     if stop_hit or tp_hit or cdn:
                         reason = "TP" if tp_hit else ("trail" if stop_hit else "EMA cross")
                         qty = min(ORDER_AMOUNT/mom_bp, btc*0.999)
                         if sell_btc(qty, price):
                             profit = (price - mom_bp) * qty
+                            last_trade_ts = time.time()  # v7.6.5
                             stats['total_profit'] += profit
                             stats['total_cycles'] += 1
                             stats['mom_cycles']   += 1
@@ -618,16 +666,17 @@ def run_session(stats):
                             log(f"MOM SELL ({reason}) {gain*100:.2f}% ${profit:+.4f}")
                             telegram(f"Momentum sell ({reason})\n{gain*100:.2f}% ${profit:+.4f}")
                             mom_on = False; mom_bp = None; mom_ts = None
-
+ 
                 if cup and not mom_on and usdc >= ORDER_AMOUNT \
                         and (not REGIME_FILTER or price >= ind['e50']):
                     if _whipsaw_ok() and buy_usdc(ORDER_AMOUNT, price):
                         mom_on = True; mom_bp = price
                         mom_ts = price - atr*TRAIL_ATR_MULT
+                        last_trade_ts = time.time()  # v7.6.5
                         dirty  = True
                         log(f"MOM BUY @ ${price:,.0f} trail ${mom_ts:,.0f}")
                         telegram(f"Momentum buy ${price:,.0f}\nTrail ${mom_ts:,.0f}")
-
+ 
             if dirty:
                 save_state({
                     'mode': m,
@@ -636,13 +685,14 @@ def run_session(stats):
                     'ngrid': ngrid, 'ncenter': ncenter,
                     'nlast': nlast, 'nsold': nsold,
                     'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
+                    'last_trade_ts': last_trade_ts,  # v7.6.5
                 })
-
+ 
         except Exception as e:
             log(f"ERROR: {e}")
-
+ 
         time.sleep(CHECK_INTERVAL)
-
+ 
     log("Shutdown — saving state")
     save_state({
         'mode': m,
@@ -651,9 +701,10 @@ def run_session(stats):
         'ngrid': ngrid, 'ncenter': ncenter,
         'nlast': nlast, 'nsold': nsold,
         'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
+        'last_trade_ts': last_trade_ts,  # v7.6.5
     })
     return 'shutdown'
-
+ 
 # ================================================================
 # ENTRY POINT
 # ================================================================
@@ -670,10 +721,12 @@ def main():
     log(f"v7.6    : non_liq={NON_LIQUIDATING} regime(e50)={REGIME_FILTER} "
         f"min_ticket=${MIN_TICKET_USD:.0f} min_profit={MIN_PROFIT_PCT*100:.2f}% "
         f"whipsaw={WHIPSAW_MAX_TRADES}/h")
+    log(f"v7.6.5  : watchdog alarm >{STALE_TRADE_HOURS}h no-trade, "
+        f"remind every {STALE_REMIND_HOURS}h")
     log(f"Telegram: {'ON' if TELEGRAM_TOKEN else 'OFF'}")
     log("=" * 52)
     telegram(f"ALL-WEATHER BOT {BOT_VERSION} ONLINE")
-
+ 
     stats    = load_stats()
     restarts = 0
     while not _shutdown:
@@ -683,6 +736,12 @@ def main():
         log(f"Restart #{restarts}")
         stats = load_stats()
     _log_file.close()
-
+ 
 if __name__ == '__main__':
     main()
+ 
+
+
+
+
+
