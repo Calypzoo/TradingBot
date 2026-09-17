@@ -23,10 +23,19 @@ load_dotenv()
 # v7.6.5: trade watchdog (stale-trade alarm + last-trade age in summary)
 # v7.6.6: watchdog threshold 48h -> 72h (kalibriert an Livedaten 07-08/2026)
 # v7.6.7: BEAR_LEVELS 8 -> 4 (Bear Grid war dauerhaft unter MIN_TICKET_USD)
+# v7.6.8: Regime-Gate EMA50 -> EMA20 (Sweep auf echten 1h-Daten, 6 Mon.),
+#         Momentum-Ticket getrennt (MOM_ORDER_AMOUNT), Grid-Ticket 40 -> 70,
+#         Positionsmenge wird pro Level/Momentum gespeichert (kein Over-Sell)
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
-ORDER_AMOUNT    = 40
+ORDER_AMOUNT    = 70    # v7.6.8: 40 -> 70. Grid-Ticket (Bull Buy/Sell). Fee-Quote
+                        # unveraendert (prozentual), aber mehr Kapital pro Zyklus.
+                        # Worst case Bull Grid: 6 untere Levels * 70 = $420.
+MOM_ORDER_AMOUNT = 150  # v7.6.8: NEU. Ticket fuer Momentum-Entries (UPTREND).
+                        # Bisher lief Momentum mit ORDER_AMOUNT=40: der +18.8%-Trade
+                        # vom 22.08. brachte $7.52. Mit 150 waeren es $28.
+                        # Risiko: Trail-Stop 2xATR = typ. 2-4% von 150 = $3-6 pro Stop.
 MAX_SPEND       = 900
 STOP_LOSS_PCT   = 0.12
 CHECK_INTERVAL  = 120
@@ -57,15 +66,20 @@ ADX_PERIOD      = 14
 #   Monate, v.a. durch (a) keine Mode-Switch-Mass-Liquidation und (b) keinen
 #   Kauf ins fallende Messer. Alle Gates sind ZUSATZ-Bedingungen: sie koennen
 #   nur Kaeufe VERHINDERN, nie einen Trade erzwingen.
-#   HINWEIS Regime-Span: Backtest lief auf 5m; dieser Bot auf 1h. Daher wird
-#   die bot-eigene e50 (1h) als Regime-Gate genutzt - Prinzip validiert,
-#   exakter Span auf 1h NICHT. Vor Live: Testnet/Dry-Run (siehe README-Notiz).
+#   HINWEIS Regime-Span: Backtest lief auf 5m (EMA150 = 12.5h). Auf 1h wurde
+#   zunaechst e50 als Naeherung genutzt (50h, ~4x traeger). v7.6.8: Sweep auf
+#   echten 1h-Daten (Mar-Sep 2026, 30 Kombinationen) -> EMA20 schlaegt EMA50
+#   in jeder Bear-Level-Variante (Ø +2.11% vs +1.39%). 20h liegt zudem am
+#   naechsten an den validierten 12.5h. Kuerzere Spannen (<20) noch ungetestet.
 # ================================================================
-BOT_VERSION         = 'v7.6.7'
+BOT_VERSION         = 'v7.6.8'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
-REGIME_FILTER       = True      # kein Bull-Grid-Kauf wenn Preis < e50 (Falling-Knife-Schutz)
+REGIME_FILTER       = True      # kein Bull-Grid-Kauf wenn Preis < Regime-EMA (Falling-Knife-Schutz)
+REGIME_SPAN         = 20        # v7.6.8: EMA-Spanne des Regime-Gates auf 1h (vorher 50).
+                                # Braucht REGIME_SPAN*3 Kerzen; fetch_ohlcv limit=80
+                                # reicht bis Spanne 26. Fuer laengere Spannen limit erhoehen!
 WHIPSAW_MAX_TRADES  = 6         # max. Entry-Buys pro rollender Stunde, dann Cooldown
  
 # ================================================================
@@ -251,7 +265,7 @@ def indicators(closes, highs, lows):
     es  = _ema(closes[-EMA_SLOW*3:],      EMA_SLOW)
     efp = _ema(closes[-EMA_FAST*3-1:-1],  EMA_FAST)
     esp = _ema(closes[-EMA_SLOW*3-1:-1],  EMA_SLOW)
-    e50 = _ema(closes[-150:], 50)
+    ereg = _ema(closes[-REGIME_SPAN*3:], REGIME_SPAN)  # v7.6.8: war e50 fix
  
     gs, ls = [], []
     for i in range(1, len(closes)):
@@ -262,12 +276,12 @@ def indicators(closes, highs, lows):
     rsi = 100 - 100/(1 + ag/al)
  
     return {'atr': max(atr,1), 'ef': ef, 'es': es, 'efp': efp,
-            'esp': esp, 'e50': e50, 'rsi': rsi, 'adx': adx}
+            'esp': esp, 'ereg': ereg, 'rsi': rsi, 'adx': adx}
  
 def mode(ind, closes, last=None):
     adx  = ind['adx']
-    bull = ind['ef'] > ind['es'] and closes[-1] > ind['e50']
-    bear = ind['ef'] < ind['es'] and closes[-1] < ind['e50']
+    bull = ind['ef'] > ind['es'] and closes[-1] > ind['ereg']
+    bear = ind['ef'] < ind['es'] and closes[-1] < ind['ereg']
     if last is None or last == 'SIDEWAYS':
         if adx >= ADX_ENTER:
             if bull: return 'UPTREND'
@@ -389,7 +403,7 @@ def run_session(stats):
             f"ALL-WEATHER BOT v7 STARTED\n"
             f"Balance: ${stats['start_balance']:,.2f}\n"
             f"BTC: ${price:,.0f} | Mode: {m}\n"
-            f"Order: ${ORDER_AMOUNT} | Check: {CHECK_INTERVAL}s\n"
+            f"Grid: ${ORDER_AMOUNT} | Mom: ${MOM_ORDER_AMOUNT} | Check: {CHECK_INTERVAL}s\n"
             f"Bull: 1% | Bear: 0.75% | RSI<{RSI_BUY_MAX}"
         )
  
@@ -405,6 +419,7 @@ def run_session(stats):
     nsold      = state.get('nsold', 0)
     mom_on     = state.get('mom_on', False)
     mom_bp     = state.get('mom_bp', None)
+    mom_qty    = state.get('mom_qty', None)  # v7.6.8: None bei Alt-State
     mom_ts     = state.get('mom_ts', None)
     dirty      = False
     bear_paused = False  # v7.6.4: einmaliges Logging der Bear-Grid-Pause
@@ -481,7 +496,7 @@ def run_session(stats):
                     if last_mode == 'UPTREND' and mom_on and btc > 0.00001:
                         sell_all(price, "leaving UPTREND")
                         time.sleep(3); usdc, btc = get_balance()
-                        mom_on = False; mom_bp = None; mom_ts = None
+                        mom_on = False; mom_bp = None; mom_ts = None; mom_qty = None
  
                     if last_mode == 'DOWNTREND' and nsold > 0.00001:
                         cost = nsold * price
@@ -500,7 +515,7 @@ def run_session(stats):
  
                 # Momentum-Status zuruecksetzen (keine offene Trail-Verwaltung ausserhalb UPTREND)
                 if last_mode == 'UPTREND':
-                    mom_on = False; mom_bp = None; mom_ts = None
+                    mom_on = False; mom_bp = None; mom_ts = None; mom_qty = None
  
                 bgrid = []; bspent = 0
                 ngrid = []; nsold  = 0
@@ -561,9 +576,10 @@ def run_session(stats):
                             and usdc >= ORDER_AMOUNT
                             and bspent < MAX_SPEND
                             and rsi < RSI_BUY_MAX
-                            and (not REGIME_FILTER or price >= ind['e50'])):
+                            and (not REGIME_FILTER or price >= ind['ereg'])):
                         if _whipsaw_ok() and buy_usdc(ORDER_AMOUNT, price):
                             lv['st'] = 'bought'; lv['bp'] = price
+                            lv['q']  = round(ORDER_AMOUNT / price, 5)  # v7.6.8: Menge merken
                             bspent += ORDER_AMOUNT; usdc -= ORDER_AMOUNT
                             last_trade_ts = time.time()  # v7.6.5
                             dirty = True
@@ -573,10 +589,13 @@ def run_session(stats):
                             and lv['bp']
                             and price >= lv['bp'] * (1 + MIN_PROFIT_PCT)):
                         bp  = lv['bp']
-                        qty = ORDER_AMOUNT / bp
+                        # v7.6.8: gespeicherte Menge verkaufen. Levels aus v7.6.7
+                        # haben kein 'q' (Ticket war $40) -> auf Bestand kappen,
+                        # sonst SELL FAILED (insufficient balance) in Endlosschleife.
+                        qty = lv.get('q') or min(ORDER_AMOUNT / bp, btc * 0.999)
                         if sell_btc(qty, price):
                             profit = (price - bp) * qty
-                            lv['st'] = 'ready'; lv['bp'] = None
+                            lv['st'] = 'ready'; lv['bp'] = None; lv['q'] = None
                             last_trade_ts = time.time()  # v7.6.5
                             bspent = max(0, bspent - ORDER_AMOUNT)
                             stats['total_profit'] += profit
@@ -662,7 +681,10 @@ def run_session(stats):
  
                     if stop_hit or tp_hit or cdn:
                         reason = "TP" if tp_hit else ("trail" if stop_hit else "EMA cross")
-                        qty = min(ORDER_AMOUNT/mom_bp, btc*0.999)
+                        # v7.6.8: gespeicherte Menge; Position aus v7.6.7 (Ticket $40,
+                        # kein mom_qty im State) -> auf Bestand kappen
+                        qty = mom_qty or min(MOM_ORDER_AMOUNT/mom_bp, btc*0.999)
+                        qty = min(qty, btc*0.999)
                         if sell_btc(qty, price):
                             profit = (price - mom_bp) * qty
                             last_trade_ts = time.time()  # v7.6.5
@@ -672,17 +694,18 @@ def run_session(stats):
                             save_stats(stats); dirty = True
                             log(f"MOM SELL ({reason}) {gain*100:.2f}% ${profit:+.4f}")
                             telegram(f"Momentum sell ({reason})\n{gain*100:.2f}% ${profit:+.4f}")
-                            mom_on = False; mom_bp = None; mom_ts = None
+                            mom_on = False; mom_bp = None; mom_ts = None; mom_qty = None
  
-                if cup and not mom_on and usdc >= ORDER_AMOUNT \
-                        and (not REGIME_FILTER or price >= ind['e50']):
-                    if _whipsaw_ok() and buy_usdc(ORDER_AMOUNT, price):
+                if cup and not mom_on and usdc >= MOM_ORDER_AMOUNT \
+                        and (not REGIME_FILTER or price >= ind['ereg']):
+                    if _whipsaw_ok() and buy_usdc(MOM_ORDER_AMOUNT, price):
                         mom_on = True; mom_bp = price
+                        mom_qty = round(MOM_ORDER_AMOUNT / price, 5)  # v7.6.8
                         mom_ts = price - atr*TRAIL_ATR_MULT
                         last_trade_ts = time.time()  # v7.6.5
                         dirty  = True
-                        log(f"MOM BUY @ ${price:,.0f} trail ${mom_ts:,.0f}")
-                        telegram(f"Momentum buy ${price:,.0f}\nTrail ${mom_ts:,.0f}")
+                        log(f"MOM BUY ${MOM_ORDER_AMOUNT} @ ${price:,.0f} trail ${mom_ts:,.0f}")
+                        telegram(f"Momentum buy ${MOM_ORDER_AMOUNT} @ ${price:,.0f}\nTrail ${mom_ts:,.0f}")
  
             if dirty:
                 save_state({
@@ -692,6 +715,7 @@ def run_session(stats):
                     'ngrid': ngrid, 'ncenter': ncenter,
                     'nlast': nlast, 'nsold': nsold,
                     'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
+                    'mom_qty': mom_qty,  # v7.6.8
                     'last_trade_ts': last_trade_ts,  # v7.6.5
                 })
  
@@ -708,6 +732,7 @@ def run_session(stats):
         'ngrid': ngrid, 'ncenter': ncenter,
         'nlast': nlast, 'nsold': nsold,
         'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
+        'mom_qty': mom_qty,  # v7.6.8
         'last_trade_ts': last_trade_ts,  # v7.6.5
     })
     return 'shutdown'
@@ -719,13 +744,13 @@ def main():
     log("=" * 52)
     log(f"ALL-WEATHER BOT {BOT_VERSION}")
     log(f"Symbol  : {SYMBOL}")
-    log(f"Order   : ${ORDER_AMOUNT} | Max: ${MAX_SPEND}")
+    log(f"Order   : grid ${ORDER_AMOUNT} | mom ${MOM_ORDER_AMOUNT} | Max: ${MAX_SPEND}")
     log(f"Check   : {CHECK_INTERVAL}s")
     log(f"Bull    : {BULL_LEVELS}L @ {BULL_SPREAD*100:.1f}% | RSI<{RSI_BUY_MAX}")
     log(f"Bear    : {BEAR_LEVELS}L @ {BEAR_SPREAD*100:.2f}%")
     log(f"Mom     : EMA{EMA_FAST}/{EMA_SLOW} trail {TRAIL_ATR_MULT}x ATR")
     log(f"ADX     : enter>{ADX_ENTER} exit<{ADX_EXIT}")
-    log(f"v7.6    : non_liq={NON_LIQUIDATING} regime(e50)={REGIME_FILTER} "
+    log(f"v7.6    : non_liq={NON_LIQUIDATING} regime(EMA{REGIME_SPAN})={REGIME_FILTER} "
         f"min_ticket=${MIN_TICKET_USD:.0f} min_profit={MIN_PROFIT_PCT*100:.2f}% "
         f"whipsaw={WHIPSAW_MAX_TRADES}/h")
     log(f"v7.6.5  : watchdog alarm >{STALE_TRADE_HOURS}h no-trade, "
