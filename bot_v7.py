@@ -13,9 +13,9 @@ load_dotenv()
  
 # ================================================================
 # ALL-WEATHER BOT v7.6
-# SIDEWAYS  = Bull Grid 12L @ 1.0%  (buy low sell high)
-# UPTREND   = Dual Momentum EMA9/21 (ride the trend)
-# DOWNTREND = Bear Grid 8L @ 0.75%  (sell high buy back lower)
+# SIDEWAYS  = Bull Grid 12L @ 0.75% (buy low sell high)  [v7.6.11]
+# UPTREND   = hold (Momentum-Entries seit v7.6.11 aus)
+# DOWNTREND = Bear Grid 4L @ 0.75%  (sell high buy back lower)  [v7.6.7]
 # ADX hysteresis: enter>25, exit<15
 # RSI filter: skip bull grid buys when RSI>58
 # v7.6: non-liquidating mode switch, e50 regime gate, min-ticket,
@@ -26,13 +26,31 @@ load_dotenv()
 # v7.6.8: Regime-Gate EMA50 -> EMA20 (Sweep auf echten 1h-Daten, 6 Mon.),
 #         Momentum-Ticket getrennt (MOM_ORDER_AMOUNT), Grid-Ticket 40 -> 70,
 #         Positionsmenge wird pro Level/Momentum gespeichert (kein Over-Sell)
+# v7.6.9: Momentum-Whipsaw-Fix: (a) Indikatoren nur auf GESCHLOSSENEN Kerzen
+#         (kein Intra-Stunden-Repaint), (b) Trend->Gegentrend nur bei ADX>=25,
+#         sonst SIDEWAYS, (c) Momentum-Re-Entry-Cooldown nach Exit/Abbruch
+# v7.6.10: BTC_CORE_MIN - Kernbestand, den der Bot nie verkauft (Bear Grid,
+#          Stop-Loss, sell_all). Vom Bot selbst eroeffnete Positionen (Bull-
+#          Level, Momentum) bleiben voll schliessbar.
+# v7.6.11: Momentum-Entries AUS (Sweep 04-10/2026: Momentum verliert in 24/24
+#          Paarungen, -10.74 $ Bot-Ertrag), BULL_SPREAD 1.0% -> 0.75% (16/16
+#          besser, +0.87 $). Exit-Pfad fuer evtl. offene Momentum-Position
+#          bleibt aktiv. Kern unveraendert 0.002 (Risikoentscheidung des Users).
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
 ORDER_AMOUNT    = 70    # v7.6.8: 40 -> 70. Grid-Ticket (Bull Buy/Sell). Fee-Quote
                         # unveraendert (prozentual), aber mehr Kapital pro Zyklus.
                         # Worst case Bull Grid: 6 untere Levels * 70 = $420.
-MOM_ORDER_AMOUNT = 150  # v7.6.8: NEU. Ticket fuer Momentum-Entries (UPTREND).
+MOMENTUM_ENABLED = False # v7.6.11: Momentum-Entries aus. Lever-Sweep 04-10/2026
+                        # (48 Laeufe, geschlossene Kerzen, v7.6.9-Fixes aktiv):
+                        # Momentum AN verliert in 24 von 24 Paarungen gegen AUS,
+                        # Ø -1.2 pp Return, -10.74 $ Bot-Ertrag, Trefferquote
+                        # 110/464. Live 18.09.-07.10.: 0 von 7. Der Exit-Pfad
+                        # (Trail/TP/Cross) bleibt aktiv, damit eine evtl. noch
+                        # offene Position sauber geschlossen wird. UPTREND ohne
+                        # Momentum = halten (Inventar + Kern), kein Grid.
+MOM_ORDER_AMOUNT = 150  # Ticket fuer Momentum-Entries, nur wenn MOMENTUM_ENABLED.
                         # Bisher lief Momentum mit ORDER_AMOUNT=40: der +18.8%-Trade
                         # vom 22.08. brachte $7.52. Mit 150 waeren es $28.
                         # Risiko: Trail-Stop 2xATR = typ. 2-4% von 150 = $3-6 pro Stop.
@@ -41,7 +59,9 @@ STOP_LOSS_PCT   = 0.12
 CHECK_INTERVAL  = 120
 RESTART_WAIT    = 600
 BULL_LEVELS     = 12
-BULL_SPREAD     = 0.0100
+BULL_SPREAD     = 0.0075 # v7.6.11: 1.0% -> 0.75%. Sweep: 0.75% schlaegt 1.0% in
+                        # 16/16 Paarungen (+0.87 $ Bot-Ertrag/6 Mon.), 0.5% faellt
+                        # wegen Fees wieder ab.
 BEAR_LEVELS     = 4     # v7.6.7: 8 -> 4. Order pro Level = btc*MAX_BTC_SELL/LEVELS.
                         # Bei 0.00239 BTC (~$153): 8 Levels = $15.31, 5 = $24.50,
                         # 4 = $30.63. Nur 4 liegt ueber MIN_TICKET_USD ($25), alles
@@ -72,7 +92,7 @@ ADX_PERIOD      = 14
 #   in jeder Bear-Level-Variante (Ø +2.11% vs +1.39%). 20h liegt zudem am
 #   naechsten an den validierten 12.5h. Kuerzere Spannen (<20) noch ungetestet.
 # ================================================================
-BOT_VERSION         = 'v7.6.8'
+BOT_VERSION         = 'v7.6.11'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
@@ -81,6 +101,41 @@ REGIME_SPAN         = 20        # v7.6.8: EMA-Spanne des Regime-Gates auf 1h (vo
                                 # Braucht REGIME_SPAN*3 Kerzen; fetch_ohlcv limit=80
                                 # reicht bis Spanne 26. Fuer laengere Spannen limit erhoehen!
 WHIPSAW_MAX_TRADES  = 6         # max. Entry-Buys pro rollender Stunde, dann Cooldown
+
+# ================================================================
+# v7.6.9 MOMENTUM-WHIPSAW-FIX
+#   Befund 18.09.-07.10.: 7 Momentum-Entries a $150, 0 Gewinner. Am 06.10.
+#   drei Entries in 3h (00:03, 02:12, 02:58), dazwischen Bear-Grid-Abverkauf.
+#   Ursachen: (a) Signale liefen auf der LAUFENDEN 1h-Kerze -> EMA9/21-Cross
+#   konnte mehrfach pro Stunde feuern (Repaint). (b) UPTREND<->DOWNTREND
+#   wechselte ohne ADX-Hysterese (ADX_ENTER galt nur aus SIDEWAYS).
+#   (c) Kein Cooldown: nach Mode-Abbruch sofort neuer Entry moeglich.
+# ================================================================
+CLOSED_CANDLES_ONLY = True      # Indikatoren ohne die laufende Kerze berechnen
+MOM_COOLDOWN_H      = 4         # Stunden Sperre fuer Momentum-Entry nach Exit/Abbruch
+
+# ================================================================
+# v7.6.10 BTC-KERNBESTAND
+#   Befund 18.07.-07.10.: Bot +37 USDC, Buy & Hold ~+331. Grund: der Bot
+#   verkauft in jeder Rally sein BTC (Bear Grid, Stop-Loss) und steht dann
+#   mit USDC daneben. BTC_CORE_MIN ist ein Boden in BTC, unter den KEIN
+#   Verkaufspfad geht:
+#     - Bear Grid dimensioniert seine Levels nur aus (btc - core)
+#     - Stop-Loss / sell_all verkaufen nur (btc - core)
+#     - Bull-Level und Momentum verkaufen weiterhin GENAU die Menge, die
+#       sie selbst gekauft haben (lv['q'], mom_qty) - der Bot kann seine
+#       eigenen Positionen immer schliessen.
+#   Konsequenzen, bewusst:
+#     - Der Kern faellt in einem Crash mit. Der 12%-Stop schuetzt ihn NICHT.
+#     - Weniger handelbares BTC -> kleinere Bear-Orders; faellt
+#       (btc-core)*0.8/BEAR_LEVELS*Preis unter MIN_TICKET_USD, pausiert
+#       das Bear Grid (wird geloggt).
+#   Wert in BTC, nicht USD: ein USD-Kern wuerde bei steigendem Kurs BTC
+#   abverkaufen - das Gegenteil von Halten.
+#   Startwert 0.002 = Bestand laut Export 07.10. (0.00204 BTC). Hoeher
+#   setzen heisst: BTC kaufen UND diesen Wert anpassen.
+# ================================================================
+BTC_CORE_MIN        = 0.002     # BTC, die der Bot nie verkauft (0 = aus)
  
 # ================================================================
 # v7.6.5 WATCHDOG
@@ -233,6 +288,12 @@ def _wilder(vals, p):
     return r
  
 def indicators(closes, highs, lows):
+    # v7.6.9: Binance liefert die laufende Kerze als letztes Element.
+    # Fuer stabile Signale (kein Repaint) wird sie hier abgeschnitten.
+    # Der LIVE-Preis fuer Grid/Trail bleibt davon unberuehrt (closes[-1]
+    # am Aufrufer). ind['close'] = letzter GESCHLOSSENER Close.
+    if CLOSED_CANDLES_ONLY and len(closes) > 1:
+        closes, highs, lows = closes[:-1], highs[:-1], lows[:-1]
     n = len(closes)
     trs = [highs[0]-lows[0]]
     for i in range(1, n):
@@ -276,22 +337,36 @@ def indicators(closes, highs, lows):
     rsi = 100 - 100/(1 + ag/al)
  
     return {'atr': max(atr,1), 'ef': ef, 'es': es, 'efp': efp,
-            'esp': esp, 'ereg': ereg, 'rsi': rsi, 'adx': adx}
+            'esp': esp, 'ereg': ereg, 'rsi': rsi, 'adx': adx,
+            'close': closes[-1]}  # v7.6.9: letzter geschlossener Close
  
 def mode(ind, closes, last=None):
     adx  = ind['adx']
-    bull = ind['ef'] > ind['es'] and closes[-1] > ind['ereg']
-    bear = ind['ef'] < ind['es'] and closes[-1] < ind['ereg']
+    # v7.6.9: Regime-Vergleich auf geschlossenem Close (ind['close']), nicht
+    # auf dem Live-Tick -> kein Flattern um die EMA20 innerhalb der Stunde.
+    c    = ind.get('close', closes[-1])
+    bull = ind['ef'] > ind['es'] and c > ind['ereg']
+    bear = ind['ef'] < ind['es'] and c < ind['ereg']
     if last is None or last == 'SIDEWAYS':
         if adx >= ADX_ENTER:
             if bull: return 'UPTREND'
             if bear: return 'DOWNTREND'
         return 'SIDEWAYS'
-    else:
-        if adx < ADX_EXIT:  return 'SIDEWAYS'
-        if bull:             return 'UPTREND'
-        if bear:             return 'DOWNTREND'
-        return last
+    if adx < ADX_EXIT:
+        return 'SIDEWAYS'
+    # v7.6.9: Direkter Wechsel Trend -> Gegentrend nur mit ADX >= ADX_ENTER.
+    # Vorher reichte ADX >= ADX_EXIT (15): UPTREND<->DOWNTREND flatterte bei
+    # schwachem Trend frei hin und her. Schwache Umkehr -> SIDEWAYS (dort
+    # greift dann wieder die normale 25er-Eintrittsschwelle).
+    if last == 'UPTREND':
+        if bull: return 'UPTREND'
+        if bear: return 'DOWNTREND' if adx >= ADX_ENTER else 'SIDEWAYS'
+        return 'UPTREND'
+    if last == 'DOWNTREND':
+        if bear: return 'DOWNTREND'
+        if bull: return 'UPTREND' if adx >= ADX_ENTER else 'SIDEWAYS'
+        return 'DOWNTREND'
+    return last
  
 # ================================================================
 # GRIDS
@@ -341,12 +416,19 @@ def sell_btc(qty, price):
     except Exception as e:
         log(f"SELL FAILED: {e}"); return None
  
+def tradeable_btc(btc):
+    """v7.6.10: BTC, ueber die der Bot verfuegen darf (Bestand minus Kern)."""
+    return max(0.0, btc - BTC_CORE_MIN)
+
 def sell_all(price, reason):
     _, btc = get_balance()
-    qty = round(btc*0.999, 5)
+    qty = round(tradeable_btc(btc)*0.999, 5)   # v7.6.10: Kern bleibt
     if qty > 0.00001:
         _retry(lambda: exchange.create_market_sell_order(SYMBOL, qty))
-        log(f"SELL ALL {qty} BTC @ ~${price:,.0f} | {reason}")
+        log(f"SELL ALL {qty} BTC @ ~${price:,.0f} | {reason}"
+            + (f" | core kept {BTC_CORE_MIN:.5f}" if BTC_CORE_MIN > 0 else ""))
+    elif BTC_CORE_MIN > 0:
+        log(f"SELL ALL skipped ({reason}): balance {btc:.5f} <= core {BTC_CORE_MIN:.5f}")
  
 # ================================================================
 # SUMMARY
@@ -375,6 +457,8 @@ def summary(stats, usdc, btc, price, m, last_trade_ts=None):
         f"Profit: ${stats['total_profit']:+.2f} | "
         f"B/Br/M: {stats['bull_cycles']}/{stats['bear_cycles']}/{stats['mom_cycles']}\n"
         f"Last trade: {lt}"
+        + (f"\nBTC {btc:.5f} | core {BTC_CORE_MIN:.5f} | tradeable {tradeable_btc(btc):.5f}"
+           if BTC_CORE_MIN > 0 else "")
     )
  
 # ================================================================
@@ -403,9 +487,23 @@ def run_session(stats):
             f"ALL-WEATHER BOT v7 STARTED\n"
             f"Balance: ${stats['start_balance']:,.2f}\n"
             f"BTC: ${price:,.0f} | Mode: {m}\n"
-            f"Grid: ${ORDER_AMOUNT} | Mom: ${MOM_ORDER_AMOUNT} | Check: {CHECK_INTERVAL}s\n"
-            f"Bull: 1% | Bear: 0.75% | RSI<{RSI_BUY_MAX}"
+            f"Grid: ${ORDER_AMOUNT} | Mom: {('$'+str(MOM_ORDER_AMOUNT)) if MOMENTUM_ENABLED else 'off'} | Check: {CHECK_INTERVAL}s\n"
+            f"Bull: {BULL_SPREAD*100:.2f}% | Bear: {BEAR_SPREAD*100:.2f}% | RSI<{RSI_BUY_MAX}"
         )
+
+    # v7.6.10: Kernbestand pruefen - bei jedem Session-Start, nicht nur beim
+    # allerersten. Liegt der Bestand unter dem Kern, kann der Bot nichts aus
+    # dem Altbestand verkaufen (Bear Grid, Stop-Loss inaktiv) - das soll
+    # sichtbar sein, nicht still passieren.
+    if BTC_CORE_MIN > 0:
+        _, _btc0 = get_balance()
+        _trd0 = tradeable_btc(_btc0)
+        log(f"BTC core: balance {_btc0:.5f} | core {BTC_CORE_MIN:.5f} | tradeable {_trd0:.5f}")
+        if _btc0 < BTC_CORE_MIN:
+            log(f"WARNING: balance below BTC_CORE_MIN - bear grid & stop-loss inactive "
+                f"until balance > core")
+            telegram(f"WARNING: BTC {_btc0:.5f} < core {BTC_CORE_MIN:.5f}\n"
+                     f"Bear grid & stop-loss inactive until balance > core")
  
     last_hour  = -1
     last_mode  = state.get('mode', None)
@@ -420,6 +518,7 @@ def run_session(stats):
     mom_on     = state.get('mom_on', False)
     mom_bp     = state.get('mom_bp', None)
     mom_qty    = state.get('mom_qty', None)  # v7.6.8: None bei Alt-State
+    mom_cd_until = state.get('mom_cd_until', 0.0)  # v7.6.9: Re-Entry-Sperre (epoch)
     mom_ts     = state.get('mom_ts', None)
     dirty      = False
     bear_paused = False  # v7.6.4: einmaliges Logging der Bear-Grid-Pause
@@ -472,6 +571,8 @@ def run_session(stats):
                 why = ""
                 if bear_paused and m == 'DOWNTREND':
                     why = "\nBear grid PAUSED (BTC below min ticket)"
+                elif m == 'UPTREND' and not MOMENTUM_ENABLED:
+                    why = "\nUPTREND hold, momentum off: no trades expected"
                 log(f"WATCHDOG: no executed trade for {stale_h:.0f}h | mode {m}")
                 telegram(f"WATCHDOG: no trade for {stale_h:.0f}h\n"
                          f"Mode: {m} | BTC: ${price:,.0f}{why}")
@@ -497,6 +598,7 @@ def run_session(stats):
                         sell_all(price, "leaving UPTREND")
                         time.sleep(3); usdc, btc = get_balance()
                         mom_on = False; mom_bp = None; mom_ts = None; mom_qty = None
+                        mom_cd_until = time.time() + MOM_COOLDOWN_H*3600  # v7.6.9
  
                     if last_mode == 'DOWNTREND' and nsold > 0.00001:
                         cost = nsold * price
@@ -515,6 +617,11 @@ def run_session(stats):
  
                 # Momentum-Status zuruecksetzen (keine offene Trail-Verwaltung ausserhalb UPTREND)
                 if last_mode == 'UPTREND':
+                    if mom_on:
+                        # v7.6.9: Position wird als Inventar weitergefuehrt (non-liq),
+                        # aber ein neuer Entry ist fuer MOM_COOLDOWN_H gesperrt.
+                        mom_cd_until = time.time() + MOM_COOLDOWN_H*3600
+                        log(f"MOM abandoned on mode switch -> cooldown {MOM_COOLDOWN_H}h")
                     mom_on = False; mom_bp = None; mom_ts = None; mom_qty = None
  
                 bgrid = []; bspent = 0
@@ -539,7 +646,7 @@ def run_session(stats):
                 if not bgrid:
                     bgrid = bull_grid(price); bcenter = price
                     blast = price; bspent = 0
-                    log(f"Bull grid @ ${bcenter:,.0f} | {BULL_LEVELS}L | {BULL_SPREAD*100:.1f}%")
+                    log(f"Bull grid @ ${bcenter:,.0f} | {BULL_LEVELS}L | {BULL_SPREAD*100:.2f}%")
                     dirty = True
  
                 # Stop loss
@@ -592,7 +699,7 @@ def run_session(stats):
                         # v7.6.8: gespeicherte Menge verkaufen. Levels aus v7.6.7
                         # haben kein 'q' (Ticket war $40) -> auf Bestand kappen,
                         # sonst SELL FAILED (insufficient balance) in Endlosschleife.
-                        qty = lv.get('q') or min(ORDER_AMOUNT / bp, btc * 0.999)
+                        qty = lv.get('q') or min(ORDER_AMOUNT / bp, tradeable_btc(btc) * 0.999)
                         if sell_btc(qty, price):
                             profit = (price - bp) * qty
                             lv['st'] = 'ready'; lv['bp'] = None; lv['q'] = None
@@ -620,14 +727,19 @@ def run_session(stats):
                     nlast = price; nsold = 0; dirty = True
                     telegram(f"Bear recentered ${price:,.0f}")
  
-                bpl = (btc * MAX_BTC_SELL) / BEAR_LEVELS if btc > 0.00001 else 0
+                # v7.6.10: nur der handelbare Teil (Bestand minus Kern) wird
+                # auf die Bear-Levels verteilt.
+                trd = tradeable_btc(btc)
+                bpl = (trd * MAX_BTC_SELL) / BEAR_LEVELS if trd > 0.00001 else 0
  
                 # v7.6.4: Anti-Fragmentierung im Bear Grid - keine Orders unter
                 # MIN_TICKET_USD. Ist der BTC-Bestand dafuer zu klein, pausiert
                 # der Bear-Zyklus (gewolltes Verhalten, kein Fehler).
                 if bpl * price < MIN_TICKET_USD:
-                    if bpl > 0 and not bear_paused:
-                        log(f"BEAR PAUSED: per-level ${bpl*price:.2f} < min ticket ${MIN_TICKET_USD:.0f}")
+                    if not bear_paused:
+                        log(f"BEAR PAUSED: per-level ${bpl*price:.2f} < min ticket "
+                            f"${MIN_TICKET_USD:.0f} | btc {btc:.5f} core {BTC_CORE_MIN:.5f} "
+                            f"tradeable {trd:.5f}")
                         bear_paused = True
                     bpl = 0
                 else:
@@ -683,8 +795,8 @@ def run_session(stats):
                         reason = "TP" if tp_hit else ("trail" if stop_hit else "EMA cross")
                         # v7.6.8: gespeicherte Menge; Position aus v7.6.7 (Ticket $40,
                         # kein mom_qty im State) -> auf Bestand kappen
-                        qty = mom_qty or min(MOM_ORDER_AMOUNT/mom_bp, btc*0.999)
-                        qty = min(qty, btc*0.999)
+                        qty = mom_qty or min(MOM_ORDER_AMOUNT/mom_bp, tradeable_btc(btc)*0.999)
+                        qty = min(qty, btc*0.999)   # eigene Position: Kern gilt hier nicht
                         if sell_btc(qty, price):
                             profit = (price - mom_bp) * qty
                             last_trade_ts = time.time()  # v7.6.5
@@ -695,8 +807,10 @@ def run_session(stats):
                             log(f"MOM SELL ({reason}) {gain*100:.2f}% ${profit:+.4f}")
                             telegram(f"Momentum sell ({reason})\n{gain*100:.2f}% ${profit:+.4f}")
                             mom_on = False; mom_bp = None; mom_ts = None; mom_qty = None
+                            mom_cd_until = time.time() + MOM_COOLDOWN_H*3600  # v7.6.9
  
-                if cup and not mom_on and usdc >= MOM_ORDER_AMOUNT \
+                if MOMENTUM_ENABLED and cup and not mom_on and usdc >= MOM_ORDER_AMOUNT \
+                        and time.time() >= mom_cd_until \
                         and (not REGIME_FILTER or price >= ind['ereg']):
                     if _whipsaw_ok() and buy_usdc(MOM_ORDER_AMOUNT, price):
                         mom_on = True; mom_bp = price
@@ -716,6 +830,7 @@ def run_session(stats):
                     'nlast': nlast, 'nsold': nsold,
                     'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
                     'mom_qty': mom_qty,  # v7.6.8
+                    'mom_cd_until': mom_cd_until,  # v7.6.9
                     'last_trade_ts': last_trade_ts,  # v7.6.5
                 })
  
@@ -733,6 +848,7 @@ def run_session(stats):
         'nlast': nlast, 'nsold': nsold,
         'mom_on': mom_on, 'mom_bp': mom_bp, 'mom_ts': mom_ts,
         'mom_qty': mom_qty,  # v7.6.8
+        'mom_cd_until': mom_cd_until,  # v7.6.9
         'last_trade_ts': last_trade_ts,  # v7.6.5
     })
     return 'shutdown'
@@ -744,9 +860,10 @@ def main():
     log("=" * 52)
     log(f"ALL-WEATHER BOT {BOT_VERSION}")
     log(f"Symbol  : {SYMBOL}")
-    log(f"Order   : grid ${ORDER_AMOUNT} | mom ${MOM_ORDER_AMOUNT} | Max: ${MAX_SPEND}")
+    log(f"Order   : grid ${ORDER_AMOUNT} | mom {('$'+str(MOM_ORDER_AMOUNT)) if MOMENTUM_ENABLED else 'OFF'} | Max: ${MAX_SPEND}")
+    log(f"v7.6.11 : momentum_enabled={MOMENTUM_ENABLED} bull_spread={BULL_SPREAD*100:.2f}%")
     log(f"Check   : {CHECK_INTERVAL}s")
-    log(f"Bull    : {BULL_LEVELS}L @ {BULL_SPREAD*100:.1f}% | RSI<{RSI_BUY_MAX}")
+    log(f"Bull    : {BULL_LEVELS}L @ {BULL_SPREAD*100:.2f}% | RSI<{RSI_BUY_MAX}")
     log(f"Bear    : {BEAR_LEVELS}L @ {BEAR_SPREAD*100:.2f}%")
     log(f"Mom     : EMA{EMA_FAST}/{EMA_SLOW} trail {TRAIL_ATR_MULT}x ATR")
     log(f"ADX     : enter>{ADX_ENTER} exit<{ADX_EXIT}")
@@ -755,6 +872,9 @@ def main():
         f"whipsaw={WHIPSAW_MAX_TRADES}/h")
     log(f"v7.6.5  : watchdog alarm >{STALE_TRADE_HOURS}h no-trade, "
         f"remind every {STALE_REMIND_HOURS}h")
+    log(f"v7.6.9  : closed_candles={CLOSED_CANDLES_ONLY} trend-flip needs ADX>={ADX_ENTER} "
+        f"mom_cooldown={MOM_COOLDOWN_H}h")
+    log(f"v7.6.10 : btc_core_min={BTC_CORE_MIN:.5f} BTC (never sold by bot)")
     log(f"Telegram: {'ON' if TELEGRAM_TOKEN else 'OFF'}")
     log("=" * 52)
     telegram(f"ALL-WEATHER BOT {BOT_VERSION} ONLINE")
