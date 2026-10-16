@@ -12,10 +12,12 @@ from datetime import datetime
 load_dotenv()
  
 # ================================================================
-# ALL-WEATHER BOT v7.6
-# SIDEWAYS  = Bull Grid 12L @ 0.75% (buy low sell high)  [v7.6.11]
-# UPTREND   = hold (Momentum-Entries seit v7.6.11 aus)
-# DOWNTREND = Bear Grid 4L @ 0.75%  (sell high buy back lower)  [v7.6.7]
+# ALL-WEATHER BOT v7.7
+# SIDEWAYS  = Bull Grid 12L @ 0.75%: Kauf auf Level i, Verkauf auf Level i+1 [v7.7.0]
+# UPTREND   = hold (Momentum-Entries seit v7.6.11 aus); offene Bull-Lots
+#             werden weiter an ihrem Ziel verkauft
+# DOWNTREND = hold (Bear Grid seit v7.7.0 aus, BEAR_ENABLED); offene Bull-Lots
+#             werden weiter an ihrem Ziel verkauft
 # ADX hysteresis: enter>25, exit<15
 # RSI filter: skip bull grid buys when RSI>58
 # v7.6: non-liquidating mode switch, e50 regime gate, min-ticket,
@@ -36,6 +38,21 @@ load_dotenv()
 #          Paarungen, -10.74 $ Bot-Ertrag), BULL_SPREAD 1.0% -> 0.75% (16/16
 #          besser, +0.87 $). Exit-Pfad fuer evtl. offene Momentum-Position
 #          bleibt aktiv. Kern unveraendert 0.002 (Risikoentscheidung des Users).
+# v7.7.0: Befund Export 18.09.-16.10.: (1) Bull Grid verkaufte auf DEMSELBEN
+#         Level, auf dem es gekauft hatte (Kauf price<=gp, Verkauf price>=gp)
+#         -> Gewinn/Zyklus nur MIN_PROFIT_PCT + Ueberschiessen (live Ø +0.23 %
+#         brutto, 7 von 8 Zyklen < 0.75 %), BULL_SPREAD bestimmte nur die
+#         Leveldichte. (2) Bear Grid verkaufte das Inventar der Bull-Levels
+#         unter Einstand (26 Bear-Sells ohne eigenen Kauf), danach Rueckkauf
+#         hoeher durch das Bull Grid; mit Kern nur noch $25-33-Tickets.
+#         (3) Mode-Switch loeschte bgrid -> gekaufte Levels wurden zu
+#         herrenlosem Inventar.
+#         Fix: Jeder Bull-Kauf bekommt ein Ziel tp = Level*(1+BULL_SPREAD)
+#         (= naechstes Level). Verkauf nur bei price >= tp. Offene Lots
+#         ueberleben Mode-Switch und Recenter und werden in JEDEM Modus
+#         verkauft, sobald das Ziel erreicht ist. Bear Grid aus
+#         (BEAR_ENABLED=False, DOWNTREND = halten). Bull-Verkauf auf
+#         tradeable_btc gekappt (Kern bleibt wirklich unangetastet).
 # ================================================================
 SYMBOL          = 'BTC/USDC'
 TIMEFRAME       = '1h'
@@ -62,6 +79,12 @@ BULL_LEVELS     = 12
 BULL_SPREAD     = 0.0075 # v7.6.11: 1.0% -> 0.75%. Sweep: 0.75% schlaegt 1.0% in
                         # 16/16 Paarungen (+0.87 $ Bot-Ertrag/6 Mon.), 0.5% faellt
                         # wegen Fees wieder ab.
+BEAR_ENABLED    = False # v7.7.0: Bear Grid aus. Live 18.09.-16.10.: 26 Bear-Sells
+                        # ohne eigenen Kauf dahinter = Abverkauf der Bull-Lots
+                        # unter Einstand (15.10.: Lot 83.5k bei 81.0-81.8k verkauft,
+                        # 16.10. Rueckkauf 82.1-82.7k). Mit BTC_CORE_MIN sind die
+                        # Tickets nur noch $25-33 (Fee-Fragmentierung). DOWNTREND
+                        # = halten; offene Bull-Lots werden weiter am Ziel verkauft.
 BEAR_LEVELS     = 4     # v7.6.7: 8 -> 4. Order pro Level = btc*MAX_BTC_SELL/LEVELS.
                         # Bei 0.00239 BTC (~$153): 8 Levels = $15.31, 5 = $24.50,
                         # 4 = $30.63. Nur 4 liegt ueber MIN_TICKET_USD ($25), alles
@@ -92,7 +115,7 @@ ADX_PERIOD      = 14
 #   in jeder Bear-Level-Variante (Ø +2.11% vs +1.39%). 20h liegt zudem am
 #   naechsten an den validierten 12.5h. Kuerzere Spannen (<20) noch ungetestet.
 # ================================================================
-BOT_VERSION         = 'v7.6.11'
+BOT_VERSION         = 'v7.7.0'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
@@ -375,9 +398,43 @@ def bull_grid(center):
     g = []
     for i in range(-BULL_LEVELS//2, BULL_LEVELS//2+1):
         g.append({'p': round(center*(1+i*BULL_SPREAD),2),
-                  'st': 'ready', 'bp': None})
+                  'st': 'ready', 'bp': None, 'q': None, 'tp': None})
     return sorted(g, key=lambda x: x['p'])
- 
+
+def bull_target(lv):
+    """v7.7.0: Verkaufsziel eines gekauften Levels = naechstes Level hoeher.
+    Basis ist das Level (nicht der Fill), damit ein Fill unterhalb des Levels
+    (Gap) das Ziel nicht nach unten zieht; liegt der Fill ueber dem Level,
+    gilt der Fill."""
+    base = max(lv['p'], lv.get('bp') or 0)
+    return round(base * (1 + BULL_SPREAD), 2)
+
+def migrate_bull_levels(grid):
+    """v7.7.0: Alt-State (<= v7.6.11) hat kein 'tp'; gekaufte Levels bekommen
+    ihr Ziel nachgetragen, damit sie nicht mehr auf dem Kauf-Level verkaufen."""
+    n = 0
+    for lv in grid or []:
+        if lv.get('st') == 'bought' and not lv.get('tp'):
+            lv['tp'] = bull_target(lv); n += 1
+        lv.setdefault('q', None); lv.setdefault('tp', None)
+    if n:
+        log(f"MIGRATE: {n} open bull lot(s) got sell target (+{BULL_SPREAD*100:.2f}%)")
+    return grid
+
+def rebuild_bull_grid(center, old):
+    """v7.7.0: Neues Grid um 'center', aber gekaufte Levels (offene Lots)
+    bleiben erhalten - sie werden weiter an ihrem Ziel verkauft, nie
+    vergessen oder vom Bear Grid abverkauft. Faellt ein neues Level auf
+    einen gehaltenen Preis, ersetzt das gehaltene Level das neue."""
+    held = [lv for lv in (old or []) if lv.get('st') == 'bought']
+    g = bull_grid(center)
+    held_p = {lv['p'] for lv in held}
+    g = [lv for lv in g if lv['p'] not in held_p] + held
+    return sorted(g, key=lambda x: x['p'])
+
+def bull_spent(grid):
+    return sum(ORDER_AMOUNT for lv in (grid or []) if lv.get('st') == 'bought')
+
 def bear_grid(center):
     g = []
     for i in range(-BEAR_LEVELS//2, BEAR_LEVELS//2+1):
@@ -433,8 +490,13 @@ def sell_all(price, reason):
 # ================================================================
 # SUMMARY
 # ================================================================
-def summary(stats, usdc, btc, price, m, last_trade_ts=None):
+def summary(stats, usdc, btc, price, m, last_trade_ts=None, bgrid=None):
     total = usdc + btc*price
+    # v7.7.0: offene Bull-Lots mit Ziel in der Summary
+    _lots = [lv for lv in (bgrid or []) if lv.get('st') == 'bought']
+    lots_txt = (f"Open lots: {len(_lots)} | next target "
+                f"${min(lv['tp'] for lv in _lots if lv.get('tp')):,.0f}"
+                if _lots and any(lv.get('tp') for lv in _lots) else "Open lots: 0")
     pnl   = total - stats['start_balance'] if stats['start_balance'] else 0
     pct   = pnl/stats['start_balance']*100 if stats['start_balance'] else 0
     # v7.6.5: Alter des letzten Trades (None = noch keiner bekannt)
@@ -450,13 +512,14 @@ def summary(stats, usdc, btc, price, m, last_trade_ts=None):
     log(f"  Profit   : ${stats['total_profit']:+.4f} | Cycles: {stats['total_cycles']}")
     log(f"  Bull/Bear/Mom: {stats['bull_cycles']}/{stats['bear_cycles']}/{stats['mom_cycles']}")
     log(f"  LastTrade: {lt}")
+    log(f"  {lots_txt}")
     log("=" * 52)
     telegram(
         f"Mode: {m} | BTC: ${price:,.0f}\n"
         f"Balance: ${total:,.2f} | PnL: ${pnl:+.2f} ({pct:+.2f}%)\n"
         f"Profit: ${stats['total_profit']:+.2f} | "
         f"B/Br/M: {stats['bull_cycles']}/{stats['bear_cycles']}/{stats['mom_cycles']}\n"
-        f"Last trade: {lt}"
+        f"Last trade: {lt}\n{lots_txt}"
         + (f"\nBTC {btc:.5f} | core {BTC_CORE_MIN:.5f} | tradeable {tradeable_btc(btc):.5f}"
            if BTC_CORE_MIN > 0 else "")
     )
@@ -507,10 +570,14 @@ def run_session(stats):
  
     last_hour  = -1
     last_mode  = state.get('mode', None)
-    bgrid      = state.get('bgrid', [])
+    bgrid      = migrate_bull_levels(state.get('bgrid', []))  # v7.7.0
     bcenter    = state.get('bcenter', price)
     blast      = state.get('blast', price)
     bspent     = state.get('bspent', 0)
+    _open = [lv for lv in bgrid if lv.get('st') == 'bought']
+    if _open:
+        log(f"Open bull lots: {len(_open)} | "
+            + " ".join(f"{lv['bp']:,.0f}->{lv['tp']:,.0f}" for lv in _open))
     ngrid      = state.get('ngrid', [])
     ncenter    = state.get('ncenter', price)
     nlast      = state.get('nlast', price)
@@ -541,7 +608,50 @@ def run_session(stats):
             return False
         recent_buys.append(now)
         return True
- 
+
+    def _bull_sell_pass(price, btc):
+        """v7.7.0: Offene Bull-Lots an ihrem Ziel verkaufen - in JEDEM Modus.
+        Verkauf nur bei price >= tp (naechstes Level) UND >= bp*(1+MIN_PROFIT).
+        Kein Crossing-Check mehr (blast): nach Gap/Restart wird nichts verpasst.
+        Menge auf tradeable_btc gekappt - der Kern wird nie angefasst.
+        Gibt (btc, sold_any) zurueck."""
+        nonlocal last_trade_ts, dirty
+        sold_any = False
+        for lv in bgrid:
+            if lv.get('st') != 'bought' or not lv.get('bp'):
+                continue
+            tp = lv.get('tp') or bull_target(lv)
+            if price < tp or price < lv['bp'] * (1 + MIN_PROFIT_PCT):
+                continue
+            bp  = lv['bp']
+            q   = lv.get('q') or round(ORDER_AMOUNT / bp, 5)
+            cap = round(tradeable_btc(btc) * 0.999, 5)
+            qty = min(q, cap)
+            if qty < 0.00001 or qty * price < 5.0:
+                # Lot existiert im Wallet nicht mehr (z.B. frueher vom Bear Grid
+                # verkauft) -> Level freigeben statt SELL FAILED in Endlosschleife.
+                log(f"BULL LOT GONE: level ${lv['p']:,.0f} q {q:.5f} but tradeable "
+                    f"{cap:.5f} -> level released")
+                lv['st'] = 'ready'; lv['bp'] = None; lv['q'] = None; lv['tp'] = None
+                dirty = True
+                continue
+            if sell_btc(qty, price):
+                profit = (price - bp) * qty
+                if qty < q:
+                    log(f"BULL PARTIAL: wanted {q:.5f}, sold {qty:.5f} (core cap)")
+                lv['st'] = 'ready'; lv['bp'] = None; lv['q'] = None; lv['tp'] = None
+                last_trade_ts = time.time()
+                btc = max(0.0, btc - qty); sold_any = True
+                stats['total_profit'] += profit
+                stats['total_cycles'] += 1
+                stats['bull_cycles']  += 1
+                save_stats(stats); dirty = True
+                log(f"BULL CYCLE ${profit:+.4f} ({(price/bp-1)*100:+.2f}%) | "
+                    f"Total ${stats['total_profit']:+.4f}")
+                telegram(f"Bull cycle ${profit:+.4f} ({(price/bp-1)*100:+.2f}%)\n"
+                         f"Total ${stats['total_profit']:+.2f}")
+        return btc, sold_any
+
     while not _shutdown:
         try:
             closes, highs, lows = get_candles()
@@ -560,7 +670,7 @@ def run_session(stats):
             # Hourly summary
             h = datetime.now().hour
             if h != last_hour:
-                summary(stats, usdc, btc, price, m, last_trade_ts)
+                summary(stats, usdc, btc, price, m, last_trade_ts, bgrid)
                 last_hour = h
  
             # v7.6.5 Watchdog: Alarm bei zu langer Trade-Stille
@@ -569,7 +679,9 @@ def run_session(stats):
             if (stale_h >= STALE_TRADE_HOURS
                     and time.time() - last_stale_alert >= STALE_REMIND_HOURS*3600):
                 why = ""
-                if bear_paused and m == 'DOWNTREND':
+                if m == 'DOWNTREND' and not BEAR_ENABLED:
+                    why = "\nDOWNTREND hold, bear grid off: only lot sells at target"
+                elif bear_paused and m == 'DOWNTREND':
                     why = "\nBear grid PAUSED (BTC below min ticket)"
                 elif m == 'UPTREND' and not MOMENTUM_ENABLED:
                     why = "\nUPTREND hold, momentum off: no trades expected"
@@ -624,15 +736,23 @@ def run_session(stats):
                         log(f"MOM abandoned on mode switch -> cooldown {MOM_COOLDOWN_H}h")
                     mom_on = False; mom_bp = None; mom_ts = None; mom_qty = None
  
-                bgrid = []; bspent = 0
+                # v7.7.0: bgrid wird NICHT mehr geloescht - offene Lots bleiben
+                # mit ihrem Ziel erhalten und werden in jedem Modus verkauft.
+                # Vorher wurden gekaufte Levels hier zu herrenlosem Inventar.
                 ngrid = []; nsold  = 0
- 
+
                 if m == 'SIDEWAYS':
-                    bgrid = bull_grid(price); bcenter = price
-                    blast = price; bspent = 0
+                    bgrid = rebuild_bull_grid(price, bgrid); bcenter = price
+                    blast = price; bspent = bull_spent(bgrid)
+                    _open = [lv for lv in bgrid if lv['st'] == 'bought']
+                    log(f"Bull grid @ ${bcenter:,.0f} | {BULL_LEVELS}L | "
+                        f"{BULL_SPREAD*100:.2f}% | open lots carried: {len(_open)}")
                 elif m == 'DOWNTREND':
-                    ngrid = bear_grid(price); ncenter = price
-                    nlast = price; nsold = 0
+                    if BEAR_ENABLED:
+                        ngrid = bear_grid(price); ncenter = price
+                        nlast = price; nsold = 0
+                    else:
+                        log("DOWNTREND: hold (bear grid off) - open bull lots sell at target")
                 elif m == 'UPTREND':
                     pass
  
@@ -640,7 +760,13 @@ def run_session(stats):
                 save_stats(stats); dirty = True
  
             last_mode = m
- 
+
+            # ---- v7.7.0: offene Bull-Lots in JEDEM Modus am Ziel verkaufen ----
+            if bgrid:
+                btc, _sold = _bull_sell_pass(price, btc)
+                if _sold:
+                    bspent = bull_spent(bgrid)
+
             # ---- SIDEWAYS: Bull Grid + RSI filter ----
             if m == 'SIDEWAYS':
                 if not bgrid:
@@ -664,8 +790,9 @@ def run_session(stats):
                         # v7.6: nicht verkaufen; nur Grid neu zentrieren. Bereits
                         # gekaufte Positionen bleiben im Wallet (kein Zwangsverkauf).
                         log(f"BULL RECENTER (non-liq) @ ${price:,.0f}")
-                        bgrid = bull_grid(price); bcenter = price
-                        blast = price; bspent = 0; dirty = True
+                        # v7.7.0: offene Lots mitnehmen statt vergessen
+                        bgrid = rebuild_bull_grid(price, bgrid); bcenter = price
+                        blast = price; bspent = bull_spent(bgrid); dirty = True
                         telegram(f"Bull recentered (non-liq) ${price:,.0f}")
                     else:
                         log(f"BULL RECENTER @ ${price:,.0f}")
@@ -687,33 +814,19 @@ def run_session(stats):
                         if _whipsaw_ok() and buy_usdc(ORDER_AMOUNT, price):
                             lv['st'] = 'bought'; lv['bp'] = price
                             lv['q']  = round(ORDER_AMOUNT / price, 5)  # v7.6.8: Menge merken
+                            lv['tp'] = bull_target(lv)                  # v7.7.0: Ziel = Level+1
                             bspent += ORDER_AMOUNT; usdc -= ORDER_AMOUNT
                             last_trade_ts = time.time()  # v7.6.5
                             dirty = True
-                    # SELL — v7.6: nur mit Mindestprofit (> Fee-Huerde)
-                    elif (price >= gp > blast
-                            and lv['st'] == 'bought'
-                            and lv['bp']
-                            and price >= lv['bp'] * (1 + MIN_PROFIT_PCT)):
-                        bp  = lv['bp']
-                        # v7.6.8: gespeicherte Menge verkaufen. Levels aus v7.6.7
-                        # haben kein 'q' (Ticket war $40) -> auf Bestand kappen,
-                        # sonst SELL FAILED (insufficient balance) in Endlosschleife.
-                        qty = lv.get('q') or min(ORDER_AMOUNT / bp, tradeable_btc(btc) * 0.999)
-                        if sell_btc(qty, price):
-                            profit = (price - bp) * qty
-                            lv['st'] = 'ready'; lv['bp'] = None; lv['q'] = None
-                            last_trade_ts = time.time()  # v7.6.5
-                            bspent = max(0, bspent - ORDER_AMOUNT)
-                            stats['total_profit'] += profit
-                            stats['total_cycles'] += 1
-                            stats['bull_cycles']  += 1
-                            save_stats(stats); dirty = True
-                            log(f"BULL CYCLE ${profit:+.4f} | Total ${stats['total_profit']:+.4f}")
-                            telegram(f"Bull cycle ${profit:+.4f}\nTotal ${stats['total_profit']:+.2f}")
+                            log(f"BULL BUY level ${gp:,.0f} fill ${price:,.0f} "
+                                f"-> target ${lv['tp']:,.0f}")
+                    # SELL: v7.7.0 -> zentral in _bull_sell_pass (price >= tp),
+                    # nicht mehr auf dem Kauf-Level.
                 blast = price
  
-            # ---- DOWNTREND: Bear Grid ----
+            # ---- DOWNTREND: Bear Grid (v7.7.0: nur wenn BEAR_ENABLED) ----
+            elif m == 'DOWNTREND' and not BEAR_ENABLED:
+                pass    # halten; offene Bull-Lots verkauft _bull_sell_pass oben
             elif m == 'DOWNTREND':
                 if not ngrid:
                     ngrid = bear_grid(price); ncenter = price
@@ -864,7 +977,7 @@ def main():
     log(f"v7.6.11 : momentum_enabled={MOMENTUM_ENABLED} bull_spread={BULL_SPREAD*100:.2f}%")
     log(f"Check   : {CHECK_INTERVAL}s")
     log(f"Bull    : {BULL_LEVELS}L @ {BULL_SPREAD*100:.2f}% | RSI<{RSI_BUY_MAX}")
-    log(f"Bear    : {BEAR_LEVELS}L @ {BEAR_SPREAD*100:.2f}%")
+    log(f"Bear    : {(str(BEAR_LEVELS)+'L @ '+format(BEAR_SPREAD*100,'.2f')+'%') if BEAR_ENABLED else 'OFF (v7.7.0)'}")
     log(f"Mom     : EMA{EMA_FAST}/{EMA_SLOW} trail {TRAIL_ATR_MULT}x ATR")
     log(f"ADX     : enter>{ADX_ENTER} exit<{ADX_EXIT}")
     log(f"v7.6    : non_liq={NON_LIQUIDATING} regime(EMA{REGIME_SPAN})={REGIME_FILTER} "
@@ -875,6 +988,8 @@ def main():
     log(f"v7.6.9  : closed_candles={CLOSED_CANDLES_ONLY} trend-flip needs ADX>={ADX_ENTER} "
         f"mom_cooldown={MOM_COOLDOWN_H}h")
     log(f"v7.6.10 : btc_core_min={BTC_CORE_MIN:.5f} BTC (never sold by bot)")
+    log(f"v7.7.0  : bull sell at level+1 (+{BULL_SPREAD*100:.2f}%), lots survive "
+        f"mode switch/recenter, bear_enabled={BEAR_ENABLED}")
     log(f"Telegram: {'ON' if TELEGRAM_TOKEN else 'OFF'}")
     log("=" * 52)
     telegram(f"ALL-WEATHER BOT {BOT_VERSION} ONLINE")
