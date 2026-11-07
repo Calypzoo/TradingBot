@@ -15,6 +15,7 @@ load_dotenv()
 # ALL-WEATHER BOT v7.7
 # SIDEWAYS  = Bull Grid 12L @ 0.75%: Kauf auf Level i, Verkauf auf Level i+1 [v7.7.0]
 #             max. MAX_OPEN_LOTS offene Lots, Cold-Start-Recenter [v7.7.1]
+#             State/Stats unter STATE_DIR (Railway Volume) [v7.7.2]
 # UPTREND   = hold (Momentum-Entries seit v7.6.11 aus); offene Bull-Lots
 #             werden weiter an ihrem Ziel verkauft
 # DOWNTREND = hold (Bear Grid seit v7.7.0 aus, BEAR_ENABLED); offene Bull-Lots
@@ -116,7 +117,7 @@ ADX_PERIOD      = 14
 #   in jeder Bear-Level-Variante (Ø +2.11% vs +1.39%). 20h liegt zudem am
 #   naechsten an den validierten 12.5h. Kuerzere Spannen (<20) noch ungetestet.
 # ================================================================
-BOT_VERSION         = 'v7.7.1'
+BOT_VERSION         = 'v7.7.2'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
@@ -241,8 +242,16 @@ def telegram(msg):
 # ================================================================
 # STATE
 # ================================================================
+# v7.7.2: State/Stats auf persistentem Pfad. Railway baut bei jedem Deploy einen
+# neuen Container; ohne Volume gingen v7_state.json (offene Lots!) und
+# v7_stats.json jedes Mal verloren. STATE_DIR in Railway auf den Volume-Mount
+# setzen (z.B. /data); lokal bleibt es '.'.
+STATE_DIR  = os.getenv('STATE_DIR', '.')
+STATE_FILE = os.path.join(STATE_DIR, 'v7_state.json')
+STATS_FILE = os.path.join(STATE_DIR, 'v7_stats.json')
+
 def _write(path, data):
-    fd, tmp = tempfile.mkstemp(dir='.', suffix='.tmp')
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w') as f:
             f.write(data); f.flush(); os.fsync(f.fileno())
@@ -252,19 +261,19 @@ def _write(path, data):
         except: pass
         raise
  
-def save_state(s): _write('v7_state.json', json.dumps(s, indent=2))
+def save_state(s): _write(STATE_FILE, json.dumps(s, indent=2))
 def load_state():
     try:
-        with open('v7_state.json') as f: return json.load(f)
+        with open(STATE_FILE) as f: return json.load(f)
     except: return None
  
 def clear_state():
-    try: os.remove('v7_state.json')
+    try: os.remove(STATE_FILE)
     except: pass
  
 def load_stats():
     try:
-        with open('v7_stats.json') as f: return json.load(f)
+        with open(STATS_FILE) as f: return json.load(f)
     except:
         return {
             'start_balance': None,
@@ -278,7 +287,7 @@ def load_stats():
             'stop_losses'  : 0,
         }
  
-def save_stats(s): _write('v7_stats.json', json.dumps(s, indent=2))
+def save_stats(s): _write(STATS_FILE, json.dumps(s, indent=2))
  
 # ================================================================
 # EXCHANGE
@@ -989,6 +998,7 @@ def run_session(stats):
 def main():
     log("=" * 52)
     log(f"ALL-WEATHER BOT {BOT_VERSION}")
+    log(f"State   : {STATE_FILE} ({'found' if os.path.exists(STATE_FILE) else 'none'})")
     log(f"Symbol  : {SYMBOL}")
     log(f"Order   : grid ${ORDER_AMOUNT} | mom {('$'+str(MOM_ORDER_AMOUNT)) if MOMENTUM_ENABLED else 'OFF'} | Max: ${MAX_SPEND}")
     log(f"v7.6.11 : momentum_enabled={MOMENTUM_ENABLED} bull_spread={BULL_SPREAD*100:.2f}%")
