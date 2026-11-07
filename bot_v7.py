@@ -14,6 +14,7 @@ load_dotenv()
 # ================================================================
 # ALL-WEATHER BOT v7.7
 # SIDEWAYS  = Bull Grid 12L @ 0.75%: Kauf auf Level i, Verkauf auf Level i+1 [v7.7.0]
+#             max. MAX_OPEN_LOTS offene Lots, Cold-Start-Recenter [v7.7.1]
 # UPTREND   = hold (Momentum-Entries seit v7.6.11 aus); offene Bull-Lots
 #             werden weiter an ihrem Ziel verkauft
 # DOWNTREND = hold (Bear Grid seit v7.7.0 aus, BEAR_ENABLED); offene Bull-Lots
@@ -115,7 +116,7 @@ ADX_PERIOD      = 14
 #   in jeder Bear-Level-Variante (Ø +2.11% vs +1.39%). 20h liegt zudem am
 #   naechsten an den validierten 12.5h. Kuerzere Spannen (<20) noch ungetestet.
 # ================================================================
-BOT_VERSION         = 'v7.7.0'
+BOT_VERSION         = 'v7.7.1'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
@@ -159,6 +160,9 @@ MOM_COOLDOWN_H      = 4         # Stunden Sperre fuer Momentum-Entry nach Exit/A
 #   setzen heisst: BTC kaufen UND diesen Wert anpassen.
 # ================================================================
 BTC_CORE_MIN        = 0.002     # BTC, die der Bot nie verkauft (0 = aus)
+MAX_OPEN_LOTS       = 4         # v7.7.1: max. gleichzeitig offene Bull-Lots (Risikodeckel,
+                                # 4 x ORDER_AMOUNT = 280 $). Backtest 11/2025-11/2026: ohne
+                                # Deckel bis 7 Lots, Ertragsunterschied ~4 $/Jahr.
  
 # ================================================================
 # v7.6.5 WATCHDOG
@@ -435,6 +439,9 @@ def rebuild_bull_grid(center, old):
 def bull_spent(grid):
     return sum(ORDER_AMOUNT for lv in (grid or []) if lv.get('st') == 'bought')
 
+def bull_open_lots(grid):
+    return sum(1 for lv in (grid or []) if lv.get('st') == 'bought')
+
 def bear_grid(center):
     g = []
     for i in range(-BEAR_LEVELS//2, BEAR_LEVELS//2+1):
@@ -578,6 +585,15 @@ def run_session(stats):
     if _open:
         log(f"Open bull lots: {len(_open)} | "
             + " ".join(f"{lv['bp']:,.0f}->{lv['tp']:,.0f}" for lv in _open))
+    # v7.7.1 Cold-Start-Guard: nach laengerer Pause kann der Preis weit vom
+    # gespeicherten bcenter liegen; der Stop-Loss-Check im Loop kaeme vor dem
+    # Recenter und wuerde offene Lots am Tief verkaufen. Daher hier einmal
+    # recentern (offene Lots bleiben erhalten).
+    if bgrid and out_of_range(price, bgrid):
+        log(f"COLD-START RECENTER: price ${price:,.0f} outside saved grid "
+            f"(center ${bcenter:,.0f}) -> rebuild, lots carried")
+        bgrid = rebuild_bull_grid(price, bgrid); bcenter = price
+        blast = price; bspent = bull_spent(bgrid)
     ngrid      = state.get('ngrid', [])
     ncenter    = state.get('ncenter', price)
     nlast      = state.get('nlast', price)
@@ -809,6 +825,7 @@ def run_session(stats):
                             and lv['st'] == 'ready'
                             and usdc >= ORDER_AMOUNT
                             and bspent < MAX_SPEND
+                            and bull_open_lots(bgrid) < MAX_OPEN_LOTS  # v7.7.1
                             and rsi < RSI_BUY_MAX
                             and (not REGIME_FILTER or price >= ind['ereg'])):
                         if _whipsaw_ok() and buy_usdc(ORDER_AMOUNT, price):
