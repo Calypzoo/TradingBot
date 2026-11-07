@@ -15,7 +15,7 @@ load_dotenv()
 # ALL-WEATHER BOT v7.7
 # SIDEWAYS  = Bull Grid 12L @ 0.75%: Kauf auf Level i, Verkauf auf Level i+1 [v7.7.0]
 #             max. MAX_OPEN_LOTS offene Lots, Cold-Start-Recenter [v7.7.1]
-#             State/Stats unter STATE_DIR (Railway Volume) [v7.7.2]
+#             State/Stats unter STATE_DIR (Railway Volume) [v7.7.2], Fallback '.' [v7.7.3]
 # UPTREND   = hold (Momentum-Entries seit v7.6.11 aus); offene Bull-Lots
 #             werden weiter an ihrem Ziel verkauft
 # DOWNTREND = hold (Bear Grid seit v7.7.0 aus, BEAR_ENABLED); offene Bull-Lots
@@ -117,7 +117,7 @@ ADX_PERIOD      = 14
 #   in jeder Bear-Level-Variante (Ø +2.11% vs +1.39%). 20h liegt zudem am
 #   naechsten an den validierten 12.5h. Kuerzere Spannen (<20) noch ungetestet.
 # ================================================================
-BOT_VERSION         = 'v7.7.2'
+BOT_VERSION         = 'v7.7.3'
 NON_LIQUIDATING     = True      # Mode-Switch & Recenter liquidieren NICHT mehr
 MIN_TICKET_USD      = 25.0      # keine Entry-Orders < diesem Wert (Anti-Fragmentierung)
 MIN_PROFIT_PCT      = 0.0020    # Bull-Sell nur wenn >= 0.20% ueber Einstand (> Fee-Huerde ~0.15%)
@@ -218,8 +218,8 @@ _log_file = open('v7_log.txt', 'a', encoding='utf-8', buffering=1)
  
 def log(msg):
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    print(line)
-    _log_file.write(line + '\n')
+    print(line, flush=True)          # v7.7.3: Railway-Logs sofort statt gepuffert
+    _log_file.write(line + '\n'); _log_file.flush()
  
 # ================================================================
 # TELEGRAM
@@ -247,6 +247,14 @@ def telegram(msg):
 # v7_stats.json jedes Mal verloren. STATE_DIR in Railway auf den Volume-Mount
 # setzen (z.B. /data); lokal bleibt es '.'.
 STATE_DIR  = os.getenv('STATE_DIR', '.')
+# v7.7.3: fehlendes Verzeichnis anlegen; geht das nicht (Volume nicht
+# gemountet), auf '.' zurueckfallen statt abzustuerzen.
+try:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    _probe = os.path.join(STATE_DIR, '.probe'); open(_probe, 'w').close(); os.remove(_probe)
+except Exception as _e:
+    print(f"WARNING: STATE_DIR {STATE_DIR!r} not writable ({_e}); falling back to '.'")
+    STATE_DIR = '.'
 STATE_FILE = os.path.join(STATE_DIR, 'v7_state.json')
 STATS_FILE = os.path.join(STATE_DIR, 'v7_stats.json')
 
